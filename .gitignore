@@ -1,0 +1,4 @@
+workspace/
+.env
+docker-compose.override.yml
+*.log
