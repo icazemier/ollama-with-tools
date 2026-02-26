@@ -1,0 +1,162 @@
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Local AI Stack — Docker Compose                           │
+# │                                                            │
+# │  Two modes (set OLLAMA_MODE in .env):                      │
+# │    native  — Ollama on host (GPU, fast!) + Docker services │
+# │    docker  — everything in Docker (CPU-only, isolated)     │
+# │                                                            │
+# │  Services:                                                 │
+# │    ollama       — AI model runtime [docker mode only]      │
+# │    ollama-proxy — localhost:11434 forwarder [docker only]  │
+# │    open-webui   — chat UI in your browser                  │
+# │    sandbox      — Node.js dev environment with git & Azure │
+# │                                                            │
+# │  Networks:                                                 │
+# │    ailocal       (internal) — AI-only, no internet         │
+# │    sandbox-net              — sandbox internet for git/az  │
+# │    webui-exposed            — exposes the chat UI port     │
+# │                                                            │
+# │  Start with: ./start.sh                                    │
+# │  Stop with:  ./stop.sh                                     │
+# └─────────────────────────────────────────────────────────────┘
+
+networks:
+  # The AI network — internal means NO internet access.
+  # Ollama, Open WebUI, and the sandbox talk to each other here.
+  ailocal:
+    driver: bridge
+    internal: true
+
+  # Gives the sandbox outbound internet for git SSH and Azure DevOps.
+  # Ollama is NOT on this network — only the sandbox.
+  sandbox-net:
+    driver: bridge
+
+  # Lets Open WebUI publish its port so your browser can reach it.
+  webui-exposed:
+    driver: bridge
+
+
+volumes:
+  ollama-data:   # Persists downloaded AI models across restarts
+  webui-data:    # Persists your chat history across restarts
+  node_modules:  # Persists installed npm packages in the sandbox
+
+services:
+  # ── Ollama: the AI model runtime (docker mode only) ───────
+  # This is where the actual AI runs. It has NO internet access —
+  # it's only on the internal ailocal network.
+  # VS Code reaches it via the ollama-proxy (see below).
+  # In native mode, Ollama runs on the host instead — this service
+  # is skipped (activated only with --profile docker).
+  ollama:
+    profiles: ["docker"]
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    networks:
+      - ailocal
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    deploy:
+      resources:
+        limits:
+          cpus: "${OLLAMA_CPUS}"
+          memory: "${OLLAMA_MEMORY}"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Open WebUI: browser-based chat interface ──────────────
+  # A ChatGPT-like UI that runs locally. Connects to Ollama for
+  # AI responses. All telemetry and update checks are disabled.
+  # Your chat history is saved locally in the webui-data volume.
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    # depends_on for ollama is added by start.sh override (docker mode only).
+    # In native mode, WebUI connects to host Ollama via host.docker.internal.
+    networks:
+      - ailocal
+      - webui-exposed
+    ports:
+      - "${WEBUI_PORT}:8080"
+    volumes:
+      - webui-data:/app/backend/data
+    environment:
+      # OLLAMA_BASE_URL is overridden by start.sh in the override file:
+      #   docker mode → http://ollama:11434
+      #   native mode → http://host.docker.internal:11434
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - ENABLE_TELEMETRY=false
+      - SCARF_NO_ANALYTICS=true
+      - DO_NOT_TRACK=true
+      - ANONYMIZED_TELEMETRY=false
+      - ENABLE_UPDATE_CHECK=false
+      - WEBUI_AUTH=false
+    deploy:
+      resources:
+        limits:
+          cpus: "${WEBUI_CPUS}"
+          memory: "${WEBUI_MEMORY}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Sandbox: dev environment ──────────────────────────────
+  # A container with Node.js, git, and Azure CLI. You can exec
+  # into it to run code, manage repos, or query Azure DevOps.
+  #
+  # Optional bind mounts (shared folder, SSH keys, git config)
+  # are added automatically by start.sh via docker-compose.override.yml.
+  # See .env to configure them.
+  sandbox:
+    build:
+      context: ./sandbox
+    container_name: sandbox
+    restart: unless-stopped
+    # depends_on for ollama is added by start.sh override (docker mode only).
+    networks:
+      - ailocal
+      - sandbox-net
+    volumes:
+      - node_modules:/workspace/node_modules
+      # Optional bind mounts (SHARED_FOLDER, SSH_KEY_PATH, GIT_CONFIG_PATH)
+      # are added dynamically via docker-compose.override.yml by start.sh
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    deploy:
+      resources:
+        limits:
+          cpus: "${SANDBOX_CPUS}"
+          memory: "${SANDBOX_MEMORY}"
+    stdin_open: true
+    tty: true
+
+  # ── Ollama Proxy: exposes Ollama API on localhost (docker mode only)
+  # A tiny TCP forwarder so VS Code (Continue) can reach Ollama
+  # at localhost:11434. Ollama itself stays fully internal with
+  # no internet. This proxy has no model data — it just passes
+  # bytes through.
+  # In native mode, Ollama is already on localhost — no proxy needed.
+  ollama-proxy:
+    profiles: ["docker"]
+    image: alpine/socat:latest
+    container_name: ollama-proxy
+    restart: unless-stopped
+    # depends_on for ollama is added by start.sh override (docker mode only).
+    networks:
+      - ailocal
+      - webui-exposed
+    ports:
+      - "127.0.0.1:11434:11434"
+    command: TCP-LISTEN:11434,fork TCP:ollama:11434

@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+#
+# start.sh — Start the local AI stack
+#
+# What this does:
+#   1. Copies .env.example to .env if you haven't created one yet
+#   2. Reads your settings from .env (including OLLAMA_MODE)
+#   3. Native mode: ensures Ollama is installed and running on your host
+#   4. Docker mode: starts Ollama in an isolated container (no internet)
+#   5. Wires optional bind mounts (shared folder, SSH keys, git config)
+#   6. Ensures all models from models.conf are downloaded
+#   7. Starts all containers
+#
+# Modes (set OLLAMA_MODE in .env):
+#   "native"  = Ollama runs on your Mac with GPU acceleration (fast!)
+#   "docker"  = Ollama runs in Docker, CPU-only but fully isolated
+#
+# Usage:
+#   ./start.sh
+#
+# This is the only command you need. It handles everything:
+#   - First run: downloads models, builds containers, starts the stack
+#   - Subsequent runs: skips already-downloaded models, starts quickly
+#   - Offline: works fine if models were previously downloaded
+#   - After .env changes: picks up new settings automatically
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# ── Detect platform ─────────────────────────────────────────
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+case "$OS" in
+    Darwin)
+        case "$ARCH" in
+            arm64) PLATFORM="macOS (Apple Silicon)" ;;
+            *)     PLATFORM="macOS (Intel)" ;;
+        esac
+        ;;
+    Linux)
+        if command -v nvidia-smi > /dev/null 2>&1; then
+            PLATFORM="Linux ($ARCH, NVIDIA GPU)"
+        else
+            PLATFORM="Linux ($ARCH)"
+        fi
+        ;;
+    *)
+        PLATFORM="$OS ($ARCH)"
+        ;;
+esac
+
+# ── Step 1: Ensure .env exists ──────────────────────────────
+if [ ! -f .env ]; then
+    echo "No .env found — copying from .env.example"
+    cp .env.example .env
+fi
+
+# Load settings
+set -a
+source .env
+set +a
+
+OLLAMA_MODE="${OLLAMA_MODE:-native}"
+
+echo "Platform: $PLATFORM"
+echo "Ollama:   $OLLAMA_MODE mode"
+
+case "$OLLAMA_MODE" in
+    native)
+        echo "          Ollama runs on your host with GPU acceleration."
+        echo "          Open WebUI and sandbox run in Docker."
+        ;;
+    docker)
+        echo "          Everything runs in Docker. CPU-only but fully isolated."
+        ;;
+    *)
+        echo "Error: OLLAMA_MODE must be 'native' or 'docker' (got: $OLLAMA_MODE)"
+        exit 1
+        ;;
+esac
+echo ""
+
+# ── Step 2: Native mode — ensure Ollama is running ──────────
+if [ "$OLLAMA_MODE" = "native" ]; then
+    if ! command -v ollama > /dev/null 2>&1; then
+        echo "Error: Ollama is not installed on your system."
+        echo ""
+        echo "Install it from: https://ollama.com/download"
+        echo "Or switch to docker mode: set OLLAMA_MODE=docker in .env"
+        exit 1
+    fi
+
+    # Check if Ollama is responding
+    if ! ollama list > /dev/null 2>&1; then
+        echo "Ollama is not running. Starting it..."
+        if [ "$OS" = "Darwin" ]; then
+            open -a Ollama 2>/dev/null || true
+        else
+            ollama serve > /dev/null 2>&1 &
+        fi
+        # Wait for it to be ready
+        for i in $(seq 1 20); do
+            if ollama list > /dev/null 2>&1; then
+                break
+            fi
+            if [ "$i" -eq 20 ]; then
+                echo "Error: Ollama failed to start. Please start it manually."
+                exit 1
+            fi
+            sleep 1
+        done
+    fi
+    echo "Ollama is running on your host."
+    echo ""
+fi
+
+# ── Step 3: Collect optional bind mounts ─────────────────────
+SANDBOX_VOLUMES=()
+
+# Shared folder — maps a host folder into the sandbox at /workspace
+if [ -n "${SHARED_FOLDER:-}" ]; then
+    SHARED_FOLDER="${SHARED_FOLDER/#\~/$HOME}"
+    if [ ! -d "$SHARED_FOLDER" ]; then
+        echo "Creating shared folder: $SHARED_FOLDER"
+        mkdir -p "$SHARED_FOLDER"
+    fi
+    SANDBOX_VOLUMES+=("$SHARED_FOLDER:/workspace")
+fi
+
+# SSH keys — mounted read-only so the sandbox can git push/pull via SSH
+if [ -n "${SSH_KEY_PATH:-}" ]; then
+    SSH_KEY_PATH="${SSH_KEY_PATH/#\~/$HOME}"
+    if [ -d "$SSH_KEY_PATH" ]; then
+        SANDBOX_VOLUMES+=("$SSH_KEY_PATH:/home/sandbox/.ssh:ro")
+    else
+        echo "Warning: SSH_KEY_PATH ($SSH_KEY_PATH) not found — skipping mount."
+    fi
+fi
+
+# Git config — mounted read-only so commits have your name/email
+if [ -n "${GIT_CONFIG_PATH:-}" ]; then
+    GIT_CONFIG_PATH="${GIT_CONFIG_PATH/#\~/$HOME}"
+    if [ -f "$GIT_CONFIG_PATH" ]; then
+        SANDBOX_VOLUMES+=("$GIT_CONFIG_PATH:/home/sandbox/.gitconfig:ro")
+    else
+        echo "Warning: GIT_CONFIG_PATH ($GIT_CONFIG_PATH) not found — skipping mount."
+    fi
+fi
+
+# ── Step 4: Generate docker-compose.override.yml ─────────────
+# This file configures mode-specific settings and optional bind mounts.
+# Docker Compose automatically merges it with docker-compose.yml.
+OVERRIDE="docker-compose.override.yml"
+
+{
+    echo "# Auto-generated by start.sh — do not edit manually"
+    echo "services:"
+
+    # ── open-webui overrides ──
+    echo "  open-webui:"
+    if [ "$OLLAMA_MODE" = "docker" ]; then
+        echo "    depends_on:"
+        echo "      ollama:"
+        echo "        condition: service_healthy"
+    else
+        echo "    environment:"
+        echo "      - OLLAMA_BASE_URL=http://host.docker.internal:11434"
+    fi
+
+    # ── sandbox overrides ──
+    echo "  sandbox:"
+    if [ "$OLLAMA_MODE" = "docker" ]; then
+        echo "    depends_on:"
+        echo "      ollama:"
+        echo "        condition: service_healthy"
+    else
+        echo "    environment:"
+        echo "      - OLLAMA_HOST=http://host.docker.internal:11434"
+    fi
+    if [ ${#SANDBOX_VOLUMES[@]} -gt 0 ]; then
+        echo "    volumes:"
+        for v in "${SANDBOX_VOLUMES[@]}"; do
+            echo "      - $v"
+        done
+    fi
+
+    # ── ollama-proxy overrides (docker mode only) ──
+    if [ "$OLLAMA_MODE" = "docker" ]; then
+        echo "  ollama-proxy:"
+        echo "    depends_on:"
+        echo "      ollama:"
+        echo "        condition: service_healthy"
+    fi
+} > "$OVERRIDE"
+
+echo "Generated $OVERRIDE"
+if [ ${#SANDBOX_VOLUMES[@]} -gt 0 ]; then
+    echo "Bind mounts:"
+    for v in "${SANDBOX_VOLUMES[@]}"; do
+        echo "  - $v"
+    done
+fi
+
+# ── Step 5: Ensure models are downloaded ──────────────────────
+if [ "$OLLAMA_MODE" = "docker" ]; then
+    # Stop Ollama if it's running from a previous start — two Ollama
+    # processes on the same data volume can cause corruption.
+    docker compose --profile docker stop ollama 2>/dev/null || true
+fi
+
+echo ""
+echo "Checking AI models..."
+if ./pull-models.sh; then
+    echo ""
+else
+    echo ""
+    echo "Note: Could not pull models. If you're offline and models were"
+    echo "previously downloaded, they'll still work. Otherwise, get online"
+    echo "and run ./start.sh again."
+    echo ""
+fi
+
+# ── Step 6: Start the stack ───────────────────────────────────
+echo "Starting local AI stack..."
+if [ "$OLLAMA_MODE" = "docker" ]; then
+    docker compose --profile docker up -d --build
+else
+    docker compose up -d --build
+fi
+
+echo ""
+echo "Stack is up. Services:"
+docker compose ps
+echo ""
+echo "Open WebUI: http://localhost:${WEBUI_PORT:-3000}"
+if [ "$OLLAMA_MODE" = "native" ]; then
+    echo "Ollama:     running natively on your host (localhost:11434)"
+fi
