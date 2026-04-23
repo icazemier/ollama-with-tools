@@ -117,40 +117,7 @@ if [ "$OLLAMA_MODE" = "native" ]; then
     echo ""
 fi
 
-# ── Step 3: Collect optional bind mounts ─────────────────────
-SANDBOX_VOLUMES=()
-
-# Shared folder — maps a host folder into the sandbox at /workspace
-if [ -n "${SHARED_FOLDER:-}" ]; then
-    SHARED_FOLDER="${SHARED_FOLDER/#\~/$HOME}"
-    if [ ! -d "$SHARED_FOLDER" ]; then
-        echo "Creating shared folder: $SHARED_FOLDER"
-        mkdir -p "$SHARED_FOLDER"
-    fi
-    SANDBOX_VOLUMES+=("$SHARED_FOLDER:/workspace")
-fi
-
-# SSH keys — mounted read-only so the sandbox can git push/pull via SSH
-if [ -n "${SSH_KEY_PATH:-}" ]; then
-    SSH_KEY_PATH="${SSH_KEY_PATH/#\~/$HOME}"
-    if [ -d "$SSH_KEY_PATH" ]; then
-        SANDBOX_VOLUMES+=("$SSH_KEY_PATH:/home/sandbox/.ssh:ro")
-    else
-        echo "Warning: SSH_KEY_PATH ($SSH_KEY_PATH) not found — skipping mount."
-    fi
-fi
-
-# Git config — mounted read-only so commits have your name/email
-if [ -n "${GIT_CONFIG_PATH:-}" ]; then
-    GIT_CONFIG_PATH="${GIT_CONFIG_PATH/#\~/$HOME}"
-    if [ -f "$GIT_CONFIG_PATH" ]; then
-        SANDBOX_VOLUMES+=("$GIT_CONFIG_PATH:/home/sandbox/.gitconfig:ro")
-    else
-        echo "Warning: GIT_CONFIG_PATH ($GIT_CONFIG_PATH) not found — skipping mount."
-    fi
-fi
-
-# ── Step 4: Generate docker-compose.override.yml ─────────────
+# ── Step 3: Generate docker-compose.override.yml ─────────────
 # This file configures mode-specific settings and optional bind mounts.
 # Docker Compose automatically merges it with docker-compose.yml.
 OVERRIDE="docker-compose.override.yml"
@@ -170,23 +137,6 @@ OVERRIDE="docker-compose.override.yml"
         echo "      - OLLAMA_BASE_URL=http://host.docker.internal:11434"
     fi
 
-    # ── sandbox overrides ──
-    echo "  sandbox:"
-    if [ "$OLLAMA_MODE" = "docker" ]; then
-        echo "    depends_on:"
-        echo "      ollama:"
-        echo "        condition: service_healthy"
-    else
-        echo "    environment:"
-        echo "      - OLLAMA_HOST=http://host.docker.internal:11434"
-    fi
-    if [ ${#SANDBOX_VOLUMES[@]} -gt 0 ]; then
-        echo "    volumes:"
-        for v in "${SANDBOX_VOLUMES[@]}"; do
-            echo "      - $v"
-        done
-    fi
-
     # ── ollama-proxy overrides (docker mode only) ──
     if [ "$OLLAMA_MODE" = "docker" ]; then
         echo "  ollama-proxy:"
@@ -197,11 +147,29 @@ OVERRIDE="docker-compose.override.yml"
 } > "$OVERRIDE"
 
 echo "Generated $OVERRIDE"
-if [ ${#SANDBOX_VOLUMES[@]} -gt 0 ]; then
-    echo "Bind mounts:"
-    for v in "${SANDBOX_VOLUMES[@]}"; do
-        echo "  - $v"
-    done
+
+# ── Step 4: Ensure TLS certs exist (mkcert) ──────────────────
+CERT_DIR="certs"
+CERT_FILE="$CERT_DIR/cert.pem"
+KEY_FILE="$CERT_DIR/key.pem"
+
+if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
+    echo ""
+    echo "Generating TLS certificates with mkcert..."
+
+    if ! command -v mkcert > /dev/null 2>&1; then
+        echo ""
+        echo "Error: mkcert is not installed. Install it with:"
+        echo "  brew install mkcert"
+        echo "  mkcert -install"
+        echo ""
+        echo "Then re-run ./start.sh"
+        exit 1
+    fi
+
+    mkdir -p "$CERT_DIR"
+    mkcert -cert-file "$CERT_FILE" -key-file "$KEY_FILE" localhost 127.0.0.1 ::1
+    echo "Certificates written to $CERT_DIR/"
 fi
 
 # ── Step 5: Ensure models are downloaded ──────────────────────
@@ -235,7 +203,8 @@ echo ""
 echo "Stack is up. Services:"
 docker compose ps
 echo ""
-echo "Open WebUI: http://localhost:${WEBUI_PORT:-3000}"
+echo "Open WebUI: https://localhost:${WEBUI_SSL_PORT:-3443}  (HTTPS — mic/camera enabled)"
+echo "            http://localhost:${WEBUI_PORT:-3000}        (HTTP fallback)"
 if [ "$OLLAMA_MODE" = "native" ]; then
     echo "Ollama:     running natively on your host (localhost:11434)"
 fi

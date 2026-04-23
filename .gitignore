@@ -1,4 +1,5 @@
 workspace/
 .env
 docker-compose.override.yml
+certs/
 *.log
