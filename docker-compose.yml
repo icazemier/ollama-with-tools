@@ -21,7 +21,7 @@
 
 networks:
   # The AI network — internal means NO internet access.
-  # Ollama, Open WebUI, and the sandbox talk to each other here.
+  # Ollama (docker mode) and Open WebUI talk to each other here.
   ailocal:
     driver: bridge
     internal: true

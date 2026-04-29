@@ -35,6 +35,11 @@ else
     docker compose down
 fi
 
+# Stop natively-running ComfyUI if present
+if [ -x "./stop-comfyui.sh" ]; then
+    ./stop-comfyui.sh
+fi
+
 echo ""
 echo "Stack stopped. Volumes (models, chat history) are preserved."
 echo "Run ./start.sh to restart."

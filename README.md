@@ -4,16 +4,20 @@ Run AI models on your own machine. Your code and conversations never leave your 
 
 ## Quick start
 
-Make sure [Docker Desktop](https://www.docker.com/products/docker-desktop/) is installed and running, then:
+You'll need [Docker Desktop](https://www.docker.com/products/docker-desktop/),
+[Ollama](https://ollama.com/download), and [mkcert](https://github.com/FiloSottile/mkcert)
+installed. Then:
 
 ```bash
 ./start.sh
 ```
 
-That's it. Open **http://localhost:3000** — you now have a local ChatGPT.
+Open **https://localhost** — you now have a local ChatGPT (with image
+generation, mic, camera). HTTP fallback at http://localhost:3000.
 
-> First run takes a few minutes (building containers + downloading ~9 GB model).
-> After that, `./start.sh` takes seconds and works fully offline.
+> First run takes a while (downloads Ollama LLM ~9 GB, SDXL ~6.5 GB, ComfyUI
+> Python deps ~2 GB). After that, `./start.sh` takes seconds and works fully
+> offline.
 
 ## Use it in VS Code
 
@@ -53,12 +57,12 @@ Now you have:
 
 ## What you get
 
-- **Chat UI** at localhost:3000 — looks and feels like ChatGPT
+- **Chat UI** at localhost:3000 (HTTP) and https://localhost (HTTPS, mic/camera enabled)
+- **Image generation** via ComfyUI (Apple Silicon: Metal-accelerated)
 - **VS Code integration** — AI chat + code completions via Continue
-- **100% local** — your prompts and code are never sent anywhere
+- **100% local** — your prompts, code, and images never leave the machine
 - **Chat history** — saved locally, survives restarts
 - **Swappable models** — try different AI models by editing `models.conf`
-- **Dev sandbox** — a container with Node.js 22, git, and Azure CLI
 
 ## Stopping and restarting
 
@@ -69,15 +73,25 @@ Now you have:
 
 ## How it works
 
-Three containers run inside Docker:
+The stack runs in two layers:
+
+**In Docker (isolated, no internet for AI):**
 
 | Container | What it does | Internet? |
 |---|---|---|
-| **Ollama** | Runs the AI model | Blocked — cannot phone home |
 | **Open WebUI** | Chat UI for your browser + API for VS Code | Local only |
-| **Sandbox** | Node.js + git + Azure CLI dev environment | Git/Azure only |
+| **Caddy** | HTTPS reverse proxy (TLS termination on port 443) | Local only |
+| **Ollama** *(docker mode)* | Runs LLMs in a container | Blocked — cannot phone home |
 
-The AI model has **zero internet access**. It physically cannot send your code or conversations anywhere — it's on an isolated Docker network with no route to the outside world.
+**Native on the host (for GPU access):**
+
+| Process | What it does | Why native |
+|---|---|---|
+| **Ollama** *(native mode, default)* | Runs LLMs with Metal GPU | Docker on Mac has no Metal access |
+| **ComfyUI** | Image generation with Metal GPU | Same — needs MPS for speed |
+
+Open WebUI (in Docker) reaches both native processes via `host.docker.internal`.
+The Docker network is internal-only — no LLM container can reach the internet.
 
 Verify it yourself: `./test-privacy.sh`
 
@@ -85,39 +99,32 @@ Verify it yourself: `./test-privacy.sh`
 
 Edit `.env` and re-run `./start.sh` to apply changes.
 
-### Resource limits
+### Resource limits (Docker mode only)
+
+In native mode (default), Ollama uses host resources directly and these are
+ignored. They only apply to the WebUI container and to Ollama when running in
+Docker mode.
 
 ```env
-OLLAMA_CPUS=4        # More CPUs = faster AI responses
-OLLAMA_MEMORY=12g    # Must fit the model + overhead — 12g for 14B models
+OLLAMA_CPUS=10       # Docker-mode Ollama only
+OLLAMA_MEMORY=14g    # Must fit the model + overhead
 WEBUI_CPUS=1
 WEBUI_MEMORY=1g
-SANDBOX_CPUS=2
-SANDBOX_MEMORY=4g
 ```
 
-### Shared folder (optional)
-
-Share a folder from your machine with the sandbox container — this is how you get project files in and out:
+### Mode switch
 
 ```env
-SHARED_FOLDER=./workspace
-# or an absolute path:
-# SHARED_FOLDER=/Users/you/projects/my-app
+OLLAMA_MODE=native   # Ollama on host with Metal GPU (fast, default)
+# OLLAMA_MODE=docker # Ollama in container, CPU-only, fully isolated
 ```
 
-The folder appears at `/workspace` inside the sandbox.
-
-### Git and SSH (optional)
-
-Mount your SSH keys and git config so you can push/pull repos from the sandbox:
+### Image generation toggle
 
 ```env
-SSH_KEY_PATH=~/.ssh
-GIT_CONFIG_PATH=~/.gitconfig
+ENABLE_IMAGE_GENERATION=true   # Auto-start ComfyUI with the stack
+COMFYUI_PORT=8188
 ```
-
-These are mounted **read-only** — the sandbox can use your keys but cannot change them.
 
 ## Choosing AI models
 
@@ -140,55 +147,172 @@ To remove old models you no longer use (and free disk space):
 ./pull-models.sh --cleanup
 ```
 
-## Using the sandbox
+## Image generation
 
-```bash
-# Open a shell
-docker exec -it sandbox bash
+Image generation uses **ComfyUI**, running natively on the host (not in Docker).
+Open WebUI in Docker reaches it via `host.docker.internal:8188`.
 
-# Run Node.js
-docker exec sandbox node -e "console.log('hello')"
+### Why native, not Docker?
 
-# Git (requires SSH_KEY_PATH in .env)
-docker exec sandbox git clone git@github.com:you/your-repo.git
+Docker on macOS runs in a Linux VM and has **no access to Metal/MPS** — image
+generation in a container would be CPU-only and take minutes per image. Native
+ComfyUI uses Apple Silicon's GPU and finishes in 15–30 seconds per image.
 
-# Azure CLI (authenticate first: az login --use-device-code)
-docker exec sandbox az devops project list --organization https://dev.azure.com/your-org
+This is the same pattern as Ollama: heavy GPU workloads run on the host, the
+WebUI runs in Docker and reaches both via `host.docker.internal`.
+
+### What's included by default
+
+- **Backend:** ComfyUI (latest), auto-installed at `~/ComfyUI` on first run
+- **Model:** Stable Diffusion XL Base 1.0 (~6.5 GB), auto-downloaded on first run
+- **Python:** ComfyUI uses its own Python 3.12 venv at `~/ComfyUI/venv`
+  (PyTorch + dependencies are installed automatically)
+- **Auto-start:** wired into `./start.sh` and `./stop.sh`
+- **Disable:** set `ENABLE_IMAGE_GENERATION=false` in `.env`
+
+On a fresh Mac, `./start.sh` does everything — clones ComfyUI, builds the
+venv, installs PyTorch with MPS, downloads SDXL, then starts the server.
+First run takes ~10–15 minutes (mostly the SDXL download). Subsequent runs
+are instant.
+
+### How to use it in Open WebUI
+
+**First-time setup** (required even though env vars set the defaults — saving
+once in the UI persists them to the DB):
+
+1. Open WebUI → **profile menu → Admin Panel → Settings → Images**
+2. **Image Generation Engine:** ComfyUI (already populated)
+3. **ComfyUI Base URL:** `http://host.docker.internal:8188` (already populated)
+4. **ComfyUI API Key:** leave empty (no auth on local ComfyUI)
+5. **Default Model:** pick `sd_xl_base_1.0.safetensors` from the dropdown
+6. Recommended defaults: 1024×1024, 30 steps, CFG 7, sampler `euler`
+7. Hit **Save** — should show "Connection successful"
+
+**Generating images in a chat** — there is **no** `/image` slash command in
+current Open WebUI builds. Use one of:
+
+- **Per-message toggle:** click the **`+` (plus)** icon next to the message
+  input → flip the **Image** / "Generate an image" toggle on → type your
+  prompt → send. The message goes straight to ComfyUI instead of Ollama.
+- **From an LLM reply:** chat normally with Ollama, then on the assistant's
+  message hover toolbar click the **picture icon**. WebUI uses that whole
+  message as the image prompt — great for "write a detailed description of a
+  cyberpunk cat" → click → image.
+
+If the `+` menu has no **Image** option:
+- Make sure you saved the Admin → Images settings (above)
+- The currently-selected model may have `image_generation` capability disabled
+  — try another model, or check **Admin → Models → [model] → Capabilities**
+
+You don't need to open ComfyUI's own UI. It just runs as an API. If you ever
+want full workflow control (LoRAs, ControlNet, custom workflows), it lives at
+http://localhost:8188.
+
+### Prompt tips for SDXL
+
+SDXL responds best to **comma-separated descriptive phrases**, not full
+sentences:
+
+```
+cyberpunk cat, neon-lit alley, rain, glowing eyes, cinematic lighting,
+shallow depth of field, photorealistic, 8k, highly detailed
 ```
 
-### JavaScript/TypeScript projects
+A useful **negative prompt** (set in image settings):
 
-Set `SHARED_FOLDER` in `.env` to your project folder, then:
-
-```bash
-docker exec -it sandbox bash
-cd /workspace
-npm install          # node_modules stay inside the container
-npm run build
-npm test
+```
+blurry, lowres, bad anatomy, watermark, text, jpeg artifacts
 ```
 
-The `node_modules` folder is stored in a Docker volume — it won't conflict with any local `node_modules` on your machine.
+First image after starting the stack takes ~30–60s (model loads into MPS).
+Subsequent images: ~15–25s.
+
+### Editing existing images
+
+WebUI's image edit feature is also wired to ComfyUI via the
+`IMAGES_EDIT_COMFYUI_BASE_URL` env var (same backend, same port). To edit:
+upload or generate an image, click the **edit icon**, paint a mask over the
+area you want to change, and describe what should appear there.
+
+Editing uses the **same SDXL Base model** via ComfyUI's mask-aware inpainting
+workflow (`VAEEncodeForInpaint`). No separate inpainting checkpoint is
+installed — the practical SDXL inpainting models on Hugging Face are either
+gated, NSFW-only, or shipped only in multi-file diffusers format that doesn't
+drop into WebUI's default edit workflow. Quality with the base model is decent
+for masked edits, not great.
+
+If you want substantially better editing later, the right upgrade is
+**FLUX.1 Kontext** (instruction-style editing — "make the cat blue and add a
+hat" — no mask needed). It needs ~12 GB peak RAM, so plan to swap out Ollama
+or use a smaller LLM during editing sessions.
+
+### Memory notes
+
+On a 16 GB Mac:
+- macOS uses ~4 GB
+- Ollama with a 14B model uses ~9 GB
+- SDXL needs ~6 GB peak
+
+That's tight — macOS unified memory will page when both are loaded. It works,
+just expect first-image latency. To stay snappy, either use a smaller Ollama
+model (e.g. `qwen2.5-coder:7b`) when generating images, or unload Ollama with
+`ollama stop <model>` before a heavy image session.
+
+### Adding more models
+
+Drop any `.safetensors` checkpoint into `~/ComfyUI/models/checkpoints/`, then
+pick it from the model dropdown in WebUI's image settings. Newer options worth
+trying (with their RAM trade-offs):
+
+| Model | Size | Notes |
+|---|---|---|
+| **SDXL Base 1.0** | ~6.5 GB | Default. Open license. Reliable. |
+| **SD 3.5 Medium** | ~5 GB | Newer, smaller. Requires HF token (license accept). |
+| **FLUX.1 schnell** | ~12 GB | Best quality, Apache 2.0, 4-step inference. Tight on 16 GB alongside Ollama. |
+| **FLUX.1 dev** | ~24 GB | Top quality. Non-commercial license. Requires 32+ GB RAM. |
+
+## LAN access
+
+The stack is reachable from other devices on your network at **https://ai.local**
+(via mDNS/Bonjour) or **https://`<your-LAN-IP>`**. The TLS cert covers all of
+those, but it's signed by your local mkcert CA — other devices won't trust it
+out of the box.
+
+To get a green padlock on phones/laptops, install the mkcert CA on each device:
+
+```bash
+# Find the CA file:
+mkcert -CAROOT
+# Then:
+#   iOS/Android — AirDrop or email rootCA.pem to the device, install via Settings, then trust it.
+#   Windows    — import into "Trusted Root Certification Authorities".
+#   Linux      — copy to /usr/local/share/ca-certificates/ and run update-ca-certificates.
+```
 
 ## Prerequisites
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
-- At least **16 GB of RAM** (the default model uses ~10 GB)
-- At least **20 GB of free disk space** for model downloads
+- **macOS** (Apple Silicon recommended for Metal-accelerated Ollama + ComfyUI)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) running
+- [Ollama](https://ollama.com/download) installed (native mode runs it on the host)
+- [mkcert](https://github.com/FiloSottile/mkcert) for local TLS (`brew install mkcert && mkcert -install`)
+- At least **16 GB of RAM** (LLM + image gen are tight at this size, see Memory notes above)
+- At least **30 GB of free disk space** (LLM ~9 GB, SDXL ~6.5 GB, ComfyUI deps ~2 GB, headroom)
 
 ## File overview
 
 ```
-├── start.sh              Start everything (downloads models automatically)
+├── start.sh              Start everything (Docker stack + native ComfyUI)
 ├── stop.sh               Stop everything (keeps your data)
-├── pull-models.sh        Manage models (--cleanup to remove unused)
+├── start-comfyui.sh      Start ComfyUI natively (called by start.sh)
+├── stop-comfyui.sh       Stop ComfyUI natively (called by stop.sh)
+├── pull-models.sh        Manage Ollama models (--cleanup to remove unused)
 ├── test-privacy.sh       Verify the AI is properly isolated
 ├── .env.example          Settings template (copy to .env)
 ├── .env                  Your settings (not in git)
-├── models.conf           Which AI models to download
-├── docker-compose.yml    Defines containers and networks
-└── sandbox/
-    └── Dockerfile        What's installed in the sandbox
+├── models.conf           Which Ollama models to download
+├── Caddyfile             TLS reverse proxy config (Caddy serves WebUI on 443)
+├── certs/                mkcert-generated TLS certs (not in git)
+└── docker-compose.yml    Defines containers and networks
 ```
 
 ## Troubleshooting
@@ -197,16 +321,27 @@ The `node_modules` folder is stored in a Docker volume — it won't conflict wit
 Run `./start.sh` — it downloads models automatically. Make sure you have internet on the first run.
 
 **Models are slow**
-This runs on CPU (no GPU in Docker on macOS). Use smaller models or increase `OLLAMA_CPUS` in `.env`.
+In native mode (default), Ollama uses Metal — it should be fast. If it isn't,
+check the active model with `ollama ps` and try a smaller one. In docker mode,
+Ollama is CPU-only and will be slow on macOS.
 
 **Out of memory**
-Lower `OLLAMA_MEMORY` in `.env`, or give Docker Desktop more RAM (Settings → Resources).
+Use a smaller LLM in `models.conf`, or stop Ollama (`ollama stop <model>`)
+before generating images. macOS unified memory pages between Ollama and
+ComfyUI when both are loaded on a 16 GB machine.
 
-**Port 3000 already in use**
-Change `WEBUI_PORT` in `.env`, then `./start.sh`.
+**Port 443 already in use**
+Another service is bound to HTTPS. Either stop it, or change `WEBUI_SSL_PORT`
+in `.env` (e.g. `3443`) and use `https://localhost:3443`.
+
+**Image generation button does nothing / "Connection failed" in WebUI Images settings**
+Check ComfyUI is up: `curl http://localhost:8188/system_stats`. If it's not,
+run `./start-comfyui.sh` directly and look at `~/ComfyUI/comfyui.log`.
+
+**Browser shows cert warning**
+On *this* machine: run `mkcert -install` and restart your browser. On *other*
+LAN devices: install the mkcert CA file on each device (see LAN access above).
 
 **VS Code Continue can't connect**
-Make sure the stack is running (`./start.sh`), and that the API key in `config.yaml` matches the one from Open WebUI.
-
-**Sandbox can't git push/pull**
-Uncomment `SSH_KEY_PATH` in `.env` and restart with `./start.sh`.
+Make sure Ollama is running (`ollama ps`). In native mode it must be running
+on the host before `./start.sh`.
