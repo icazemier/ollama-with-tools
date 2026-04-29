@@ -167,9 +167,19 @@ if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
         exit 1
     fi
 
+    # Detect LAN IP (first non-loopback IPv4)
+    LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+
     mkdir -p "$CERT_DIR"
-    mkcert -cert-file "$CERT_FILE" -key-file "$KEY_FILE" localhost 127.0.0.1 ::1
+    mkcert -cert-file "$CERT_FILE" -key-file "$KEY_FILE" \
+        localhost 127.0.0.1 ::1 ai.local ${LAN_IP:+"$LAN_IP"}
     echo "Certificates written to $CERT_DIR/"
+    echo ""
+    echo "To trust this cert on other LAN devices, install the mkcert CA:"
+    echo "  CA file: $(mkcert -CAROOT)/rootCA.pem"
+    echo "  iOS/Android: AirDrop or email the CA file, then trust it in Settings"
+    echo "  Windows:     Import into 'Trusted Root Certification Authorities'"
+    echo "  Linux:       Add to /usr/local/share/ca-certificates/ and run update-ca-certificates"
 fi
 
 # ── Step 5: Ensure models are downloaded ──────────────────────
@@ -203,8 +213,15 @@ echo ""
 echo "Stack is up. Services:"
 docker compose ps
 echo ""
-echo "Open WebUI: https://localhost:${WEBUI_SSL_PORT:-3443}  (HTTPS — mic/camera enabled)"
-echo "            http://localhost:${WEBUI_PORT:-3000}        (HTTP fallback)"
+LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+if [ "${WEBUI_SSL_PORT:-443}" = "443" ]; then
+    echo "Open WebUI: https://localhost  (this machine)"
+    echo "            https://ai.local   (LAN — mDNS)${LAN_IP:+", https://$LAN_IP  (LAN — IP)"}"
+else
+    echo "Open WebUI: https://localhost:${WEBUI_SSL_PORT}  (this machine)"
+    echo "            https://ai.local:${WEBUI_SSL_PORT}   (LAN — mDNS)"
+fi
+echo "            http://localhost:${WEBUI_PORT:-3000}  (HTTP fallback)"
 if [ "$OLLAMA_MODE" = "native" ]; then
     echo "Ollama:     running natively on your host (localhost:11434)"
 fi
