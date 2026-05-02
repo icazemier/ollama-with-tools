@@ -71,6 +71,16 @@ Now you have:
 ./start.sh              # Start again
 ```
 
+## Teardown
+
+```bash
+./teardown.sh             # Remove Docker containers + volumes (chat history, models)
+./teardown.sh --full      # Also remove ComfyUI installation (~/ComfyUI)
+./teardown.sh --nuclear   # Also remove all Ollama models + TLS certs
+```
+
+After any teardown, `./start.sh` rebuilds from scratch.
+
 ## How it works
 
 The stack runs in two layers:
@@ -89,6 +99,10 @@ The stack runs in two layers:
 |---|---|---|
 | **Ollama** *(native mode, default)* | Runs LLMs with Metal GPU | Docker on Mac has no Metal access |
 | **ComfyUI** | Image generation with Metal GPU | Same — needs MPS for speed |
+
+Both native processes are registered as **launchd user agents** on macOS, so
+they auto-start on login and restart automatically if they crash. `start.sh`
+installs these agents on first run — no manual setup needed.
 
 Open WebUI (in Docker) reaches both native processes via `host.docker.internal`.
 The Docker network is internal-only — no LLM container can reach the internet.
@@ -303,8 +317,9 @@ mkcert -CAROOT
 ```
 ├── start.sh              Start everything (Docker stack + native ComfyUI)
 ├── stop.sh               Stop everything (keeps your data)
-├── start-comfyui.sh      Start ComfyUI natively (called by start.sh)
-├── stop-comfyui.sh       Stop ComfyUI natively (called by stop.sh)
+├── teardown.sh           Remove data/installation (--full, --nuclear)
+├── start-comfyui.sh      Start ComfyUI natively; installs launchd agent on macOS
+├── stop-comfyui.sh       Stop ComfyUI natively; unloads launchd agent on macOS
 ├── pull-models.sh        Manage Ollama models (--cleanup to remove unused)
 ├── test-privacy.sh       Verify the AI is properly isolated
 ├── .env.example          Settings template (copy to .env)
