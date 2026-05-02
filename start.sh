@@ -230,6 +230,8 @@ if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && \
 EOF
     then
         echo "ComfyUI warmup queued — SDXL model loading in background."
+    else
+        echo "Warning: ComfyUI warmup failed — first image generation may be slow."
     fi
 fi
 
