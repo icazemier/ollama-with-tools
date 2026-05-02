@@ -57,6 +57,7 @@ generate_comfyui_plist() {
         <string>0.0.0.0</string>
         <string>--port</string>
         <string>${COMFYUI_PORT}</string>
+        <string>--fp32-vae</string>
     </array>
 
     <key>EnvironmentVariables</key>
@@ -154,7 +155,7 @@ else
     COMFYUI_PID_FILE="${COMFYUI_PID_FILE:-$COMFYUI_DIR/comfyui.pid}"
     echo "Starting ComfyUI on port ${COMFYUI_PORT}..."
     cd "$COMFYUI_DIR"
-    nohup python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" \
+    nohup python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" --fp32-vae \
         > "$COMFYUI_LOG" 2>&1 &
     echo $! > "$COMFYUI_PID_FILE"
 fi
