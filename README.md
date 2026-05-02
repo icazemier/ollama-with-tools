@@ -191,16 +191,8 @@ are instant.
 
 ### How to use it in Open WebUI
 
-**First-time setup** (required even though env vars set the defaults — saving
-once in the UI persists them to the DB):
-
-1. Open WebUI → **profile menu → Admin Panel → Settings → Images**
-2. **Image Generation Engine:** ComfyUI (already populated)
-3. **ComfyUI Base URL:** `http://host.docker.internal:8188` (already populated)
-4. **ComfyUI API Key:** leave empty (no auth on local ComfyUI)
-5. **Default Model:** pick `sd_xl_base_1.0.safetensors` from the dropdown
-6. Recommended defaults: 1024×1024, 30 steps, CFG 7, sampler `euler`
-7. Hit **Save** — should show "Connection successful"
+No manual setup required — `./start.sh` configures the engine, URL, and
+workflow automatically. Just open the chat and generate.
 
 **Generating images in a chat** — there is **no** `/image` slash command in
 current Open WebUI builds. Use one of:
@@ -238,8 +230,8 @@ A useful **negative prompt** (set in image settings):
 blurry, lowres, bad anatomy, watermark, text, jpeg artifacts
 ```
 
-First image after starting the stack takes ~30–60s (model loads into MPS).
-Subsequent images: ~15–25s.
+`./start.sh` queues a warmup generation at startup so the SDXL model is
+already in MPS memory when you first use the chat. All images: ~15–25s.
 
 ### Editing existing images
 
