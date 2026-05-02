@@ -230,6 +230,66 @@ echo ""
 echo "Stack is up. Services:"
 docker compose ps
 echo ""
+
+# ── Step 8: Patch ComfyUI workflow node_ids in WebUI DB ──────
+# Open WebUI seeds its default ComfyUI workflow with empty node_ids, so
+# prompt/model/size never get substituted into the workflow JSON. Result:
+# ComfyUI rejects every prompt with "ckpt_name: 'model.safetensors' not in
+# [...]". We patch the DB so the bundled workflow actually works.
+#
+# Sequence matters: WebUI caches PersistentConfig in memory and rewrites the
+# row on shutdown. So we must (1) wait for first-run DB init, (2) stop WebUI
+# to flush, (3) patch the now-quiescent DB, (4) start WebUI to read it.
+if [ "$ENABLE_IMAGE_GENERATION" = "true" ]; then
+    for i in $(seq 1 30); do
+        if docker exec open-webui test -f /app/backend/data/webui.db 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    NEEDS_PATCH=$(docker exec open-webui python - <<'PY' 2>/dev/null || echo "yes"
+import sqlite3, json
+row = sqlite3.connect('/app/backend/data/webui.db').cursor().execute(
+    "SELECT data FROM config ORDER BY id DESC LIMIT 1").fetchone()
+nodes = json.loads(row[0])['image_generation']['comfyui']['nodes'] if row else []
+print("no" if any(n.get('node_ids') for n in nodes) else "yes")
+PY
+)
+    if [ "$NEEDS_PATCH" = "yes" ]; then
+        echo "Patching ComfyUI workflow node_ids in WebUI..."
+        WEBUI_VOLUME="$(docker compose config --volumes | grep -E '^webui-data$' >/dev/null && \
+            docker volume ls --format '{{.Name}}' | grep -E '_webui-data$' | head -n1)"
+        docker compose stop open-webui >/dev/null 2>&1
+        docker run --rm -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
+import sqlite3, json
+db = sqlite3.connect('/data/webui.db')
+c = db.cursor()
+row = c.execute('SELECT id, data FROM config ORDER BY id DESC LIMIT 1').fetchone()
+cid, data = row[0], json.loads(row[1])
+data['image_generation'].setdefault('comfyui', {})['nodes'] = [
+    {'type': 'prompt',   'key': 'text',      'node_ids': ['6']},
+    {'type': 'model',    'key': 'ckpt_name', 'node_ids': ['4']},
+    {'type': 'width',    'key': 'width',     'node_ids': ['5']},
+    {'type': 'height',   'key': 'height',    'node_ids': ['5']},
+    {'type': 'steps',    'key': 'steps',     'node_ids': ['3']},
+    {'type': 'seed',     'key': 'seed',      'node_ids': ['3']},
+]
+c.execute('UPDATE config SET data=? WHERE id=?', (json.dumps(data), cid))
+db.commit()
+" || echo "Warning: ComfyUI workflow patch failed — set node_ids manually in WebUI Settings → Images."
+        docker compose start open-webui >/dev/null 2>&1
+        # Wait for WebUI to start serving again so users don't hit a transient
+        # 502 from Caddy if they reload during the patch window.
+        for i in $(seq 1 30); do
+            if curl -sf "http://localhost:${WEBUI_PORT:-3000}/health" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done
+    fi
+fi
+echo ""
 LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
 if [ "${WEBUI_SSL_PORT:-443}" = "443" ]; then
     echo "Open WebUI: https://localhost  (this machine)"
