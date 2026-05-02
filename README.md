@@ -317,6 +317,7 @@ mkcert -CAROOT
 ```
 ├── start.sh              Start everything (Docker stack + native ComfyUI)
 ├── stop.sh               Stop everything (keeps your data)
+├── status.sh             Show what's running (services, loaded models, URLs)
 ├── teardown.sh           Remove data/installation (--full, --nuclear)
 ├── start-comfyui.sh      Start ComfyUI natively; installs launchd agent on macOS
 ├── stop-comfyui.sh       Stop ComfyUI natively; unloads launchd agent on macOS
