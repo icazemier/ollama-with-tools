@@ -217,6 +217,22 @@ if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ -x "./start-comfyui.sh" ]; then
     ./start-comfyui.sh || echo "Warning: ComfyUI failed to start — Open WebUI will run without image generation."
 fi
 
+# ── Step 6b: Pre-load the SDXL model ─────────────────────────
+# Queue a 1-step 128×128 generation so the model is in RAM before the
+# first real request. curl returns immediately; ComfyUI loads async.
+if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && \
+   curl -sf "http://127.0.0.1:${COMFYUI_PORT:-8188}/system_stats" > /dev/null 2>&1; then
+    _warmup_model="${COMFYUI_DEFAULT_MODEL_NAME:-sd_xl_base_1.0.safetensors}"
+    if curl -sf "http://127.0.0.1:${COMFYUI_PORT:-8188}/prompt" \
+            -H "Content-Type: application/json" \
+            --data-binary @- > /dev/null 2>&1 << EOF
+{"prompt":{"4":{"class_type":"CheckpointLoaderSimple","inputs":{"ckpt_name":"${_warmup_model}"}},"5":{"class_type":"EmptyLatentImage","inputs":{"width":128,"height":128,"batch_size":1}},"6":{"class_type":"CLIPTextEncode","inputs":{"text":"warmup","clip":["4",1]}},"7":{"class_type":"CLIPTextEncode","inputs":{"text":"","clip":["4",1]}},"3":{"class_type":"KSampler","inputs":{"seed":1,"steps":1,"cfg":1,"sampler_name":"euler","scheduler":"normal","denoise":1,"model":["4",0],"positive":["6",0],"negative":["7",0],"latent_image":["5",0]}},"8":{"class_type":"VAEDecode","inputs":{"samples":["3",0],"vae":["4",2]}},"9":{"class_type":"SaveImage","inputs":{"filename_prefix":"warmup","images":["8",0]}}}}
+EOF
+    then
+        echo "ComfyUI warmup queued — SDXL model loading in background."
+    fi
+fi
+
 # ── Step 7: Start the stack ───────────────────────────────────
 echo ""
 echo "Starting local AI stack..."
