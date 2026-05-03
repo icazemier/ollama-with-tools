@@ -266,16 +266,20 @@ if [ "$ENABLE_IMAGE_GENERATION" = "true" ]; then
         sleep 1
     done
 
+    # SDXL requires 1024x1024 — at WebUI's default 512x512, SDXL produces
+    # solid black images. We force the size alongside the node_ids fix.
     NEEDS_PATCH=$(docker exec open-webui python - <<'PY' 2>/dev/null || echo "yes"
 import sqlite3, json
 row = sqlite3.connect('/app/backend/data/webui.db').cursor().execute(
     "SELECT data FROM config ORDER BY id DESC LIMIT 1").fetchone()
-nodes = json.loads(row[0])['image_generation']['comfyui']['nodes'] if row else []
-print("no" if any(n.get('node_ids') for n in nodes) else "yes")
+img = json.loads(row[0])['image_generation'] if row else {}
+nodes_ok = any(n.get('node_ids') for n in img.get('comfyui', {}).get('nodes', []))
+size_ok = img.get('size') == '1024x1024'
+print("no" if (nodes_ok and size_ok) else "yes")
 PY
 )
     if [ "$NEEDS_PATCH" = "yes" ]; then
-        echo "Patching ComfyUI workflow node_ids in WebUI..."
+        echo "Patching ComfyUI workflow + image size in WebUI..."
         WEBUI_VOLUME="$(docker compose config --volumes | grep -E '^webui-data$' >/dev/null && \
             docker volume ls --format '{{.Name}}' | grep -E '_webui-data$' | head -n1)"
         docker compose stop open-webui >/dev/null 2>&1
@@ -285,6 +289,7 @@ db = sqlite3.connect('/data/webui.db')
 c = db.cursor()
 row = c.execute('SELECT id, data FROM config ORDER BY id DESC LIMIT 1').fetchone()
 cid, data = row[0], json.loads(row[1])
+data['image_generation']['size'] = '1024x1024'
 data['image_generation'].setdefault('comfyui', {})['nodes'] = [
     {'type': 'prompt',   'key': 'text',      'node_ids': ['6']},
     {'type': 'model',    'key': 'ckpt_name', 'node_ids': ['4']},
@@ -295,7 +300,7 @@ data['image_generation'].setdefault('comfyui', {})['nodes'] = [
 ]
 c.execute('UPDATE config SET data=? WHERE id=?', (json.dumps(data), cid))
 db.commit()
-" || echo "Warning: ComfyUI workflow patch failed — set node_ids manually in WebUI Settings → Images."
+" || echo "Warning: ComfyUI workflow patch failed — set node_ids + size 1024x1024 manually in WebUI Settings → Images."
         docker compose start open-webui >/dev/null 2>&1
         # Wait for WebUI to start serving again so users don't hit a transient
         # 502 from Caddy if they reload during the patch window.
