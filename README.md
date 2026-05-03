@@ -4,7 +4,8 @@ Run AI models on your own machine. Your code and conversations never leave your 
 
 ## Quick start
 
-You'll need [Docker Desktop](https://www.docker.com/products/docker-desktop/),
+You'll need a Docker engine ([Colima](https://github.com/abiosoft/colima)
+recommended — see [Container engine](#container-engine) below),
 [Ollama](https://ollama.com/download), and [mkcert](https://github.com/FiloSottile/mkcert)
 installed. Then:
 
@@ -295,10 +296,53 @@ mkcert -CAROOT
 #   Linux      — copy to /usr/local/share/ca-certificates/ and run update-ca-certificates.
 ```
 
+## Container engine
+
+The stack needs *some* Docker-compatible engine to run Open WebUI + Caddy.
+**Colima** is the recommended pick: open source, ~200 MB RAM overhead,
+auto-starts via `brew services`, supports `host.docker.internal` so
+containers can reach the native Ollama and ComfyUI on the host.
+
+```bash
+brew install colima docker docker-compose
+mkdir -p ~/.docker
+echo '{"cliPluginsExtraDirs":["/opt/homebrew/lib/docker/cli-plugins"]}' > ~/.docker/config.json
+colima start --vm-type=vz --mount-type=virtiofs --cpu 2 --memory 4 --disk 30 \
+    --mount "/Volumes/Development:w"   # add any other paths your project lives under
+brew services start colima             # auto-start on login
+```
+
+> **Important:** containers reach the host via `host.docker.internal`,
+> but native Ollama defaults to `127.0.0.1`-only. Set
+> `launchctl setenv OLLAMA_HOST 0.0.0.0:11434` and restart Ollama (the
+> Mac app reads it on launch) so the WebUI container can reach it. On
+> Apple Silicon the Colima VM uses Apple's Virtualization framework
+> (`vz`) for fast, low-overhead startup.
+
+### Optional GUI
+
+Colima is headless. If you want a desktop dashboard for containers,
+install **[Podman Desktop](https://podman-desktop.io)** — it's FOSS,
+talks to Docker sockets out of the box, and runs *independently* of the
+engine. Open it when you need a GUI; quit it whenever — Colima and your
+containers keep running untouched.
+
+```bash
+brew install --cask podman-desktop
+```
+
+Other supported engines (you don't have to use Colima):
+
+| Engine | Notes |
+|---|---|
+| **Colima** | FOSS, lightweight, headless. Recommended. |
+| **OrbStack** | Closed-source (free for personal use), faster boot, native GUI, very low overhead. |
+| **Docker Desktop** | Heaviest of the three (~2–4 GB RAM). Works, but overkill for a server. |
+
 ## Prerequisites
 
 - **macOS** (Apple Silicon recommended for Metal-accelerated Ollama + ComfyUI)
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) running
+- A Docker engine — [Colima](https://github.com/abiosoft/colima) recommended (FOSS, lightweight). See [Container engine](#container-engine).
 - [Ollama](https://ollama.com/download) installed (native mode runs it on the host)
 - [mkcert](https://github.com/FiloSottile/mkcert) for local TLS (`brew install mkcert && mkcert -install`)
 - At least **16 GB of RAM** (LLM + image gen are tight at this size, see Memory notes above)
