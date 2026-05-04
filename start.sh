@@ -65,6 +65,34 @@ set +a
 
 OLLAMA_MODE="${OLLAMA_MODE:-native}"
 
+# ── Container engine (Colima) — patch daemon config ────────
+# Colima's default Docker daemon config enables the containerd snapshotter,
+# which hangs on multi-arch ghcr.io pulls (the Open WebUI image lives there).
+# We force snapshotter=false in ~/.colima/default/colima.yaml so the daemon
+# uses the classic overlay2 driver. Idempotent: only patches + restarts when
+# the config differs.
+if [ "$OS" = "Darwin" ] && command -v colima > /dev/null 2>&1; then
+    COLIMA_CFG="$HOME/.colima/default/colima.yaml"
+    if [ -f "$COLIMA_CFG" ] && ! grep -q "containerd-snapshotter: false" "$COLIMA_CFG"; then
+        echo "Patching Colima config (disable containerd-snapshotter for ghcr.io pulls)..."
+        # Replace `docker: {}` (Colima's default placeholder) or append a docker
+        # section if missing. Uses perl for portable in-place editing on BSD/GNU.
+        if grep -q "^docker: {}" "$COLIMA_CFG"; then
+            perl -i -pe 's|^docker: \{\}$|docker:\n  features:\n    buildkit: true\n    containerd-snapshotter: false|' "$COLIMA_CFG"
+        else
+            printf '\ndocker:\n  features:\n    buildkit: true\n    containerd-snapshotter: false\n' >> "$COLIMA_CFG"
+        fi
+        if colima status > /dev/null 2>&1; then
+            echo "Restarting Colima to apply daemon config..."
+            colima restart > /dev/null 2>&1
+        fi
+    fi
+    # Ensure Colima auto-starts at login (no-op if already enabled).
+    if ! brew services list 2>/dev/null | grep -qE "^colima\s+started"; then
+        brew services start colima > /dev/null 2>&1 || true
+    fi
+fi
+
 echo "Platform: $PLATFORM"
 echo "Ollama:   $OLLAMA_MODE mode"
 
@@ -83,7 +111,46 @@ case "$OLLAMA_MODE" in
 esac
 echo ""
 
-# ── Step 2: Native mode — ensure Ollama is running ──────────
+# ── Step 2: Native mode — ensure Ollama is running and bound to 0.0.0.0 ──
+# Why 0.0.0.0? Open WebUI runs in a container and reaches the host via
+# host.docker.internal:11434. Ollama defaults to 127.0.0.1 only — Docker
+# Desktop has magic routing that papers over this, but Colima/OrbStack do
+# not, so the WebUI container can't reach Ollama unless it binds to all
+# interfaces. We persist this via a launchd user agent that runs at login,
+# and force-restart Ollama on this run if it's already bound to 127.0.0.1.
+OLLAMA_ENV_LABEL="local.ollama-env"
+OLLAMA_ENV_PLIST="$HOME/Library/LaunchAgents/${OLLAMA_ENV_LABEL}.plist"
+
+generate_ollama_env_plist() {
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Sets OLLAMA_HOST=0.0.0.0:11434 in the launchd session environment so the
+  Ollama Mac app, when started by its own launchd agent, binds to all
+  interfaces. Required so containers (Open WebUI under Colima/OrbStack) can
+  reach Ollama via host.docker.internal:11434.
+
+  Managed by start.sh — do not edit manually.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${OLLAMA_ENV_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/launchctl</string>
+        <string>setenv</string>
+        <string>OLLAMA_HOST</string>
+        <string>0.0.0.0:11434</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+EOF
+}
+
 if [ "$OLLAMA_MODE" = "native" ]; then
     if ! command -v ollama > /dev/null 2>&1; then
         echo "Error: Ollama is not installed on your system."
@@ -91,6 +158,21 @@ if [ "$OLLAMA_MODE" = "native" ]; then
         echo "Install it from: https://ollama.com/download"
         echo "Or switch to docker mode: set OLLAMA_MODE=docker in .env"
         exit 1
+    fi
+
+    # Install/update the launchd plist that sets OLLAMA_HOST at login.
+    if [ "$OS" = "Darwin" ]; then
+        NEW_PLIST="$(generate_ollama_env_plist)"
+        EXISTING_PLIST="$(cat "$OLLAMA_ENV_PLIST" 2>/dev/null || true)"
+        if [ "$NEW_PLIST" != "$EXISTING_PLIST" ]; then
+            mkdir -p "$(dirname "$OLLAMA_ENV_PLIST")"
+            printf '%s\n' "$NEW_PLIST" > "$OLLAMA_ENV_PLIST"
+            launchctl unload "$OLLAMA_ENV_PLIST" 2>/dev/null || true
+            launchctl load "$OLLAMA_ENV_PLIST"
+            echo "Installed launchd agent: $OLLAMA_ENV_PLIST (sets OLLAMA_HOST=0.0.0.0:11434)"
+        fi
+        # Apply to the running session in case the agent above hasn't fired yet.
+        launchctl setenv OLLAMA_HOST 0.0.0.0:11434
     fi
 
     # Check if Ollama is responding
@@ -101,7 +183,6 @@ if [ "$OLLAMA_MODE" = "native" ]; then
         else
             ollama serve > /dev/null 2>&1 &
         fi
-        # Wait for it to be ready
         for i in $(seq 1 20); do
             if ollama list > /dev/null 2>&1; then
                 break
@@ -113,7 +194,26 @@ if [ "$OLLAMA_MODE" = "native" ]; then
             sleep 1
         done
     fi
-    echo "Ollama is running on your host."
+
+    # If Ollama is bound to 127.0.0.1 only, restart it so it picks up
+    # OLLAMA_HOST=0.0.0.0:11434. lsof shows "*:11434" when bound to all
+    # interfaces, "localhost:11434" or "127.0.0.1:11434" otherwise.
+    if [ "$OS" = "Darwin" ]; then
+        if lsof -nP -iTCP:11434 -sTCP:LISTEN 2>/dev/null | grep -qE '127\.0\.0\.1:11434|localhost:11434'; then
+            echo "Ollama is bound to 127.0.0.1 — restarting so containers can reach it..."
+            osascript -e 'quit app "Ollama"' 2>/dev/null || true
+            pkill -f "ollama serve" 2>/dev/null || true
+            sleep 2
+            open -a Ollama 2>/dev/null || true
+            for i in $(seq 1 15); do
+                if lsof -nP -iTCP:11434 -sTCP:LISTEN 2>/dev/null | grep -q '\*:11434'; then
+                    break
+                fi
+                sleep 1
+            done
+        fi
+    fi
+    echo "Ollama is running on your host (bound to 0.0.0.0:11434)."
     echo ""
 fi
 
