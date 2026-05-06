@@ -16,9 +16,31 @@ installed. Then:
 Open **https://localhost** — you now have a local ChatGPT (with image
 generation, mic, camera). HTTP fallback at http://localhost:3000.
 
-> First run takes a while (downloads Ollama LLM ~9 GB, SDXL ~6.5 GB, ComfyUI
-> Python deps ~2 GB). After that, `./start.sh` takes seconds and works fully
-> offline.
+> First run takes a while (downloads the Ollama chat LLM ~9 GB and the chosen
+> image model). After that, `./start.sh` takes seconds and works fully offline.
+
+### Pick your image backend (optional)
+
+Two backends ship out of the box. `./start.sh` auto-detects: existing
+`~/ComfyUI` install → `comfyui` (no surprise migration), otherwise
+`ollama` (the simpler default for fresh installs). Override anytime in `.env`:
+
+```env
+# IMAGE_BACKEND=ollama     # Ollama image models via a tiny OpenAI-compatible
+                           # bridge container. Dead simple, macOS only.
+# IMAGE_BACKEND=comfyui    # ComfyUI in a venv on the host. More flexible,
+                           # works on Linux too, more moving parts.
+
+# IMAGE_MODEL semantics depend on IMAGE_BACKEND:
+#   ollama  → Ollama tag, e.g. x/flux2-klein:4b (5.7 GB, default, Apache 2.0)
+#   comfyui → preset, e.g. sdxl (default), flux-schnell, flux-dev
+```
+
+For the Ollama backend `./start.sh` pulls the model via `ollama pull`, brings
+up the bridge container, and patches Open WebUI to talk to it.
+For the ComfyUI backend it bootstraps `~/ComfyUI`, downloads the matching
+checkpoint, and patches the workflow JSON. See [Image generation](#image-generation)
+for the full picture.
 
 ## Use it in VS Code
 
@@ -139,7 +161,14 @@ OLLAMA_MODE=native   # Ollama on host with Metal GPU (fast, default)
 ```env
 ENABLE_IMAGE_GENERATION=true   # Auto-start ComfyUI with the stack
 COMFYUI_PORT=8188
+IMAGE_MODEL=sdxl               # sdxl | flux-schnell | flux-dev
+# HF_TOKEN=hf_xxx               # Required only for flux-dev (gated repo)
 ```
+
+`IMAGE_MODEL` decides the checkpoint, sampler, cfg, step count, and
+workflow that `start.sh` writes into Open WebUI. Direct overrides
+(`COMFYUI_DEFAULT_MODEL_NAME` / `_URL`) still win for advanced users
+dropping in a custom `.safetensors`.
 
 ## Choosing AI models
 
@@ -164,31 +193,75 @@ To remove old models you no longer use (and free disk space):
 
 ## Image generation
 
-Image generation uses **ComfyUI**, running natively on the host (not in Docker).
-Open WebUI in Docker reaches it via `host.docker.internal:8188`.
+Two backends, picked via `IMAGE_BACKEND` in `.env` (auto-detected if unset:
+existing `~/ComfyUI` → `comfyui`, otherwise `ollama`).
 
-### Why native, not Docker?
+### Backend: `ollama` (default for fresh installs, macOS only)
 
-Docker on macOS runs in a Linux VM and has **no access to Metal/MPS** — image
-generation in a container would be CPU-only and take minutes per image. Native
-ComfyUI uses Apple Silicon's GPU and finishes in 15–30 seconds per image.
+Open WebUI is wired to its built-in `openai` image engine, but the URL points
+at `ollama-image-bridge` — a ~70-line FastAPI service that translates
+`POST /v1/images/generations` into Ollama's `POST /api/generate`. Image gen
+runs through the same Ollama process you already use for chat (Metal-accelerated
+via Apple's Metal Performance Shaders).
 
-This is the same pattern as Ollama: heavy GPU workloads run on the host, the
-WebUI runs in Docker and reaches both via `host.docker.internal`.
+Pros: no extra Python venv, no MPS dtype dragons, one fewer launchd agent,
+~5.7 GB on disk for `x/flux2-klein:4b` (Apache 2.0). Cons: macOS only (Ollama
+upstream limitation), still flagged "experimental" by Ollama.
+
+### Backend: `comfyui` (Linux + power users)
+
+ComfyUI runs natively on the host (not in Docker — Docker on macOS has **no**
+access to Metal/MPS, so a container would be CPU-only). Open WebUI in Docker
+reaches it via `host.docker.internal:8188`. SDXL VAE runs on CPU (`--cpu-vae`)
+to dodge the recurring black-image NaN issue on Apple Silicon.
 
 ### What's included by default
 
 - **Backend:** ComfyUI (latest), auto-installed at `~/ComfyUI` on first run
-- **Model:** Stable Diffusion XL Base 1.0 (~6.5 GB), auto-downloaded on first run
+- **Model:** picked by `IMAGE_MODEL` in `.env` — defaults to **SDXL Base 1.0**
+  (~6.5 GB). Set to `flux-schnell` (~17 GB) for higher quality and better
+  prompt adherence; see [Switching image models](#switching-image-models).
 - **Python:** ComfyUI uses its own Python 3.12 venv at `~/ComfyUI/venv`
   (PyTorch + dependencies are installed automatically)
 - **Auto-start:** wired into `./start.sh` and `./stop.sh`
 - **Disable:** set `ENABLE_IMAGE_GENERATION=false` in `.env`
 
 On a fresh Mac, `./start.sh` does everything — clones ComfyUI, builds the
-venv, installs PyTorch with MPS, downloads SDXL, then starts the server.
-First run takes ~10–15 minutes (mostly the SDXL download). Subsequent runs
-are instant.
+venv, installs PyTorch with MPS, downloads the checkpoint, then starts the
+server. First run takes ~10–15 minutes for SDXL (or ~25–30 minutes for
+Flux at typical home bandwidth). Subsequent runs are instant.
+
+### Switching image models
+
+Three presets ship out of the box. Set `IMAGE_MODEL` in `.env` and re-run
+`./start.sh`:
+
+| `IMAGE_MODEL` | Checkpoint | Size | Steps | CFG | Scheduler | License | Notes |
+|---|---|---|---|---|---|---|---|
+| `sdxl` | `sd_xl_base_1.0.safetensors` | 6.5 GB | 20 | 7.0 | normal | OpenRAIL | Reliable default. Comma-phrase prompts. |
+| `flux-schnell` | `flux1-schnell-fp8.safetensors` | ~17 GB | 4 | 1.0 | simple | Apache-2.0 | Fast (4 steps), great prompt adherence, ungated. |
+| `flux-dev` | `flux1-dev-fp8.safetensors` | ~17 GB | 20 | 1.0 | simple | Non-commercial | Top quality. **Gated** — set `HF_TOKEN` after [accepting the license](https://huggingface.co/black-forest-labs/FLUX.1-dev). |
+
+What `./start.sh` does each time you switch:
+
+1. Downloads the matching checkpoint into `~/ComfyUI/models/checkpoints/`
+   (skipped if already present).
+2. Warms ComfyUI by loading the checkpoint into MPS memory.
+3. Patches the Open WebUI database with a model-tuned workflow JSON
+   (correct cfg, steps, sampler, scheduler) and a `_managed_image_model`
+   marker, then restarts the WebUI container so it picks up the new config.
+
+All previously downloaded checkpoints stay on disk, so flipping back and
+forth is just an `.env` edit + a script run — no re-download. The model
+dropdown in WebUI's image settings will list every `.safetensors` in the
+checkpoints directory; pick the one that matches `IMAGE_MODEL` for correct
+results, since the workflow's cfg/steps/scheduler only match that one.
+
+> **Why not configure Flux through WebUI's image settings UI?** WebUI
+> exposes prompt, model, size, steps, and seed — but not cfg, sampler, or
+> scheduler. Flux needs cfg=1.0 and scheduler=simple to produce sharp
+> images; SDXL needs cfg=7 and scheduler=normal. Those live inside the
+> workflow JSON, which `start.sh` writes to the DB on your behalf.
 
 ### How to use it in Open WebUI
 
@@ -215,24 +288,34 @@ You don't need to open ComfyUI's own UI. It just runs as an API. If you ever
 want full workflow control (LoRAs, ControlNet, custom workflows), it lives at
 http://localhost:8188.
 
-### Prompt tips for SDXL
+### Prompt tips
 
-SDXL responds best to **comma-separated descriptive phrases**, not full
-sentences:
+**SDXL** responds best to **comma-separated descriptive phrases**:
 
 ```
 cyberpunk cat, neon-lit alley, rain, glowing eyes, cinematic lighting,
 shallow depth of field, photorealistic, 8k, highly detailed
 ```
 
-A useful **negative prompt** (set in image settings):
+Useful negative prompt (image settings): `blurry, lowres, bad anatomy,
+watermark, text, jpeg artifacts`.
+
+**Flux (schnell or dev)** is the opposite — it understands **natural
+sentences and even short paragraphs**, including text rendered inside the
+image. No keyword-stuffing required:
 
 ```
-blurry, lowres, bad anatomy, watermark, text, jpeg artifacts
+A cyberpunk cat sitting in a rainy neon-lit alley, holding a paper sign
+that reads "open source", cinematic lighting, shallow depth of field.
 ```
 
-`./start.sh` queues a warmup generation at startup so the SDXL model is
-already in MPS memory when you first use the chat. All images: ~15–25s.
+Flux is **distilled**, so the negative prompt is effectively unused — leave
+it empty. CFG above 1 will make Flux output mushy or oversaturated.
+
+`./start.sh` queues a warmup generation at startup so whichever checkpoint
+is active is already in MPS memory when you first use the chat.
+Generation times on Apple Silicon (M-series, 1024²): SDXL ~15–25 s,
+Flux schnell ~30–60 s (4 steps), Flux dev ~2–4 min (20 steps).
 
 ### Editing existing images
 
@@ -255,28 +338,41 @@ or use a smaller LLM during editing sessions.
 
 ### Memory notes
 
-On a 16 GB Mac:
-- macOS uses ~4 GB
-- Ollama with a 14B model uses ~9 GB
-- SDXL needs ~6 GB peak
+Approximate peak working-set on Apple Silicon:
 
-That's tight — macOS unified memory will page when both are loaded. It works,
-just expect first-image latency. To stay snappy, either use a smaller Ollama
-model (e.g. `qwen2.5-coder:7b`) when generating images, or unload Ollama with
-`ollama stop <model>` before a heavy image session.
+| Component | Peak RAM |
+|---|---|
+| macOS | ~4 GB |
+| Ollama, 14B model | ~9 GB |
+| SDXL (1024²) | ~6 GB |
+| Flux schnell fp8 (1024²) | ~14 GB |
+| Flux dev fp8 (1024²) | ~16 GB |
 
-### Adding more models
+On a 16 GB Mac, **SDXL + Ollama** is tight but workable — macOS unified
+memory will page when both are loaded. **Flux + Ollama on 16 GB is not
+realistic**: stop Ollama (`ollama stop <model>`) before image sessions,
+switch to a smaller LLM like `qwen2.5-coder:7b`, or plan on 32 GB+ for a
+"both loaded" workflow.
 
-Drop any `.safetensors` checkpoint into `~/ComfyUI/models/checkpoints/`, then
-pick it from the model dropdown in WebUI's image settings. Newer options worth
-trying (with their RAM trade-offs):
+### Adding more checkpoints
 
-| Model | Size | Notes |
-|---|---|---|
-| **SDXL Base 1.0** | ~6.5 GB | Default. Open license. Reliable. |
-| **SD 3.5 Medium** | ~5 GB | Newer, smaller. Requires HF token (license accept). |
-| **FLUX.1 schnell** | ~12 GB | Best quality, Apache 2.0, 4-step inference. Tight on 16 GB alongside Ollama. |
-| **FLUX.1 dev** | ~24 GB | Top quality. Non-commercial license. Requires 32+ GB RAM. |
+The three presets above (`sdxl`, `flux-schnell`, `flux-dev`) are managed
+end-to-end by `./start.sh` — checkpoint download, warmup, and WebUI
+workflow all line up. For anything else, drop a `.safetensors` file into
+`~/ComfyUI/models/checkpoints/` and pick it from the model dropdown in
+WebUI's image settings. The dropdown lists every file in that directory.
+
+Heads-up: WebUI's bundled workflow expects a single-file checkpoint
+loadable via `CheckpointLoaderSimple` (UNet+CLIP+VAE bundled). Multi-file
+diffusers, GGUF quants, and SD 3.5 split-file releases need either custom
+ComfyUI nodes or a custom workflow JSON. If you go down that road, you'll
+likely also need to override `IMAGE_MODEL`'s defaults via the direct
+escape hatches:
+
+```env
+COMFYUI_DEFAULT_MODEL_NAME=your-model.safetensors
+COMFYUI_DEFAULT_MODEL_URL=https://...
+```
 
 ## LAN access
 
@@ -346,7 +442,7 @@ Other supported engines (you don't have to use Colima):
 - [Ollama](https://ollama.com/download) installed (native mode runs it on the host)
 - [mkcert](https://github.com/FiloSottile/mkcert) for local TLS (`brew install mkcert && mkcert -install`)
 - At least **16 GB of RAM** (LLM + image gen are tight at this size, see Memory notes above)
-- At least **30 GB of free disk space** (LLM ~9 GB, SDXL ~6.5 GB, ComfyUI deps ~2 GB, headroom)
+- At least **30 GB of free disk space** for the SDXL default (LLM ~9 GB, SDXL ~6.5 GB, ComfyUI deps ~2 GB, headroom). Bump to **45 GB** if you plan to use Flux schnell or dev (~17 GB checkpoint).
 
 ## File overview
 

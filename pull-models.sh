@@ -73,6 +73,23 @@ if [ ${#MODELS[@]} -eq 0 ] && [ "$CLEANUP" = false ]; then
     exit 0
 fi
 
+# Auto-include the image generation model when IMAGE_BACKEND=ollama so users
+# don't have to remember to add it to models.conf. Only applies when the
+# model tag looks like an Ollama tag (contains : or /), so leftover ComfyUI
+# presets ("sdxl") are ignored here.
+IMAGE_BACKEND="${IMAGE_BACKEND:-}"
+if [ "$IMAGE_BACKEND" = "ollama" ]; then
+    IMAGE_MODEL="${IMAGE_MODEL:-x/flux2-klein:4b}"
+    if echo "$IMAGE_MODEL" | grep -qE '[:/]'; then
+        _already_listed=0
+        for _m in "${MODELS[@]+"${MODELS[@]}"}"; do
+            [ "$_m" = "$IMAGE_MODEL" ] && _already_listed=1 && break
+        done
+        [ "$_already_listed" = "0" ] && MODELS+=("$IMAGE_MODEL")
+        unset _already_listed _m
+    fi
+fi
+
 # ── Helper: normalize model name ─────────────────────────────
 # Ollama treats "llama3.1" as "llama3.1:latest" — normalize so
 # comparisons work correctly.

@@ -6,10 +6,12 @@
 # │    docker  — everything in Docker (CPU-only, isolated)     │
 # │                                                            │
 # │  Services:                                                 │
-# │    ollama       — AI model runtime [docker mode only]      │
-# │    ollama-proxy — localhost:11434 forwarder [docker only]  │
-# │    open-webui   — chat UI in your browser                  │
-# │    caddy        — TLS termination (HTTPS for WebUI)        │
+# │    ollama              — AI model runtime [docker mode]    │
+# │    ollama-proxy        — localhost:11434 fwd [docker mode] │
+# │    ollama-image-bridge — OpenAI→Ollama image adapter       │
+# │                          [profile image-ollama]            │
+# │    open-webui          — chat UI in your browser           │
+# │    caddy               — TLS termination (HTTPS for WebUI) │
 # │                                                            │
 # │  Networks:                                                 │
 # │    ailocal       (internal) — AI-only, no internet         │
@@ -122,6 +124,35 @@ services:
       - ./certs:/certs:ro
     depends_on:
       - open-webui
+
+  # ── Ollama Image Bridge: OpenAI-compatible adapter for Ollama image gen ──
+  # Exposes POST /v1/images/generations and translates to Ollama's
+  # /api/generate so Open WebUI's "openai" image engine can target
+  # Ollama image models (x/flux2-klein, x/z-image-turbo).
+  #
+  # Activated via the "image-ollama" profile when IMAGE_BACKEND=ollama
+  # (start.sh adds the profile). On webui-exposed so it can reach host
+  # Ollama via host.docker.internal; on ailocal so Open WebUI can reach
+  # it at http://ollama-image-bridge:8000.
+  ollama-image-bridge:
+    profiles: ["image-ollama"]
+    build: ./ollama-image-bridge
+    container_name: ollama-image-bridge
+    restart: unless-stopped
+    networks:
+      - ailocal
+      - webui-exposed
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - IMAGE_MODEL=${IMAGE_MODEL:-x/flux2-klein:4b}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   # ── Ollama Proxy: exposes Ollama API on localhost (docker mode only)
   # A tiny TCP forwarder so VS Code (Continue) can reach Ollama
