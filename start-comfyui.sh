@@ -58,6 +58,7 @@ generate_comfyui_plist() {
         <string>--port</string>
         <string>${COMFYUI_PORT}</string>
         <string>--cpu-vae</string>
+        <string>--lowvram</string>
     </array>
 
     <key>EnvironmentVariables</key>
@@ -155,7 +156,7 @@ else
     COMFYUI_PID_FILE="${COMFYUI_PID_FILE:-$COMFYUI_DIR/comfyui.pid}"
     echo "Starting ComfyUI on port ${COMFYUI_PORT}..."
     cd "$COMFYUI_DIR"
-    nohup python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" --cpu-vae \
+    nohup python main.py --listen 0.0.0.0 --port "$COMFYUI_PORT" --cpu-vae --lowvram \
         > "$COMFYUI_LOG" 2>&1 &
     echo $! > "$COMFYUI_PID_FILE"
 fi
