@@ -70,7 +70,7 @@ services:
   # AI responses. All telemetry and update checks are disabled.
   # Your chat history is saved locally in the webui-data volume.
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:latest
     container_name: open-webui
     restart: unless-stopped
     # depends_on for ollama is added by start.sh override (docker mode only).
