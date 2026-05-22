@@ -245,6 +245,10 @@ COMFYUI_PORT="${COMFYUI_PORT:-8188}"
         echo "      - IMAGE_GENERATION_ENGINE=comfyui"
         echo "      - COMFYUI_BASE_URL=http://host.docker.internal:${COMFYUI_PORT}"
         echo "      - IMAGES_EDIT_COMFYUI_BASE_URL=http://host.docker.internal:${COMFYUI_PORT}"
+        # WebUI's validate_url blocks private-IP URLs by default. Since ComfyUI runs
+        # on the host and its image URLs resolve to host.docker.internal (private IP),
+        # we must enable local web fetch so get_image_data can retrieve generated images.
+        echo "      - ENABLE_RAG_LOCAL_WEB_FETCH=true"
     fi
 
     # ── ollama-proxy overrides (docker mode only) ──
