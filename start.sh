@@ -93,6 +93,85 @@ if [ "$OS" = "Darwin" ] && command -v colima > /dev/null 2>&1; then
     fi
 fi
 
+# ── Install boot-stack launchd agent (macOS only) ────────────
+# Registers boot-stack.sh as a login agent so the Docker stack comes
+# up automatically after every reboot, power loss, or login — without
+# needing to run start.sh manually each time.
+BOOT_STACK_LABEL="local.ai-stack.boot"
+BOOT_STACK_PLIST="$HOME/Library/LaunchAgents/${BOOT_STACK_LABEL}.plist"
+
+generate_boot_stack_plist() {
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Brings up the Docker AI stack (Open WebUI + Caddy) after every login.
+  Waits for Colima/Docker to be ready, then runs docker compose up -d and
+  applies the ComfyUI DB patch if needed.
+
+  Managed by start.sh — do not edit manually.
+
+  To inspect logs: tail -f ${SCRIPT_DIR}/logs/boot-stack.log
+  To disable:      launchctl unload ${BOOT_STACK_PLIST}
+  To re-enable:    launchctl load   ${BOOT_STACK_PLIST}
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${BOOT_STACK_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${SCRIPT_DIR}/boot-stack.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${HOME}</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Start at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart only on failure (exit non-zero); stop once healthy (exit 0) -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Wait 30 s between retries so Docker has time to start -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- boot-stack.sh writes its own timestamped log to logs/boot-stack.log;
+         stdout is silenced here to prevent launchd doubling every line. -->
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>${SCRIPT_DIR}/logs/boot-stack.log</string>
+</dict>
+</plist>
+EOF
+}
+
+if [ "$OS" = "Darwin" ]; then
+    NEW_BOOT_PLIST="$(generate_boot_stack_plist)"
+    EXISTING_BOOT_PLIST="$(cat "$BOOT_STACK_PLIST" 2>/dev/null || true)"
+    if [ "$NEW_BOOT_PLIST" != "$EXISTING_BOOT_PLIST" ]; then
+        mkdir -p "$(dirname "$BOOT_STACK_PLIST")"
+        printf '%s\n' "$NEW_BOOT_PLIST" > "$BOOT_STACK_PLIST"
+        launchctl unload "$BOOT_STACK_PLIST" 2>/dev/null || true
+        launchctl load "$BOOT_STACK_PLIST"
+        echo "Installed launchd agent: $BOOT_STACK_PLIST"
+    fi
+fi
+
 echo "Platform: $PLATFORM"
 echo "Ollama:   $OLLAMA_MODE mode"
 

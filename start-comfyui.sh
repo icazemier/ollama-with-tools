@@ -57,6 +57,10 @@ generate_comfyui_plist() {
         <string>0.0.0.0</string>
         <string>--port</string>
         <string>${COMFYUI_PORT}</string>
+        <!-- bf16 has the same exponent range as fp32 so it cannot overflow to
+             NaN like fp16 can. This fixes the black-image NaN cascade on MPS
+             that persists even with --cpu-vae when the UNet produces NaN latents. -->
+        <string>--bf16-unet</string>
         <string>--cpu-vae</string>
         <string>--lowvram</string>
     </array>
