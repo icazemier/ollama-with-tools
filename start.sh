@@ -64,6 +64,10 @@ source .env
 set +a
 
 OLLAMA_MODE="${OLLAMA_MODE:-native}"
+IMAGE_GEN_BACKEND="${IMAGE_GEN_BACKEND:-comfyui}"
+DRAW_THINGS_PORT="${DRAW_THINGS_PORT:-7860}"
+DRAW_THINGS_PROXY_PORT="${DRAW_THINGS_PROXY_PORT:-7861}"
+DRAW_THINGS_DEFAULT_MODEL="${DRAW_THINGS_DEFAULT_MODEL:-flux_1_dev_q4p.ckpt}"
 
 # ── Container engine (Colima) — patch daemon config ────────
 # Colima's default Docker daemon config enables the containerd snapshotter,
@@ -321,13 +325,18 @@ COMFYUI_PORT="${COMFYUI_PORT:-8188}"
     fi
     if [ "$ENABLE_IMAGE_GENERATION" = "true" ]; then
         echo "      - ENABLE_IMAGE_GENERATION=true"
-        echo "      - IMAGE_GENERATION_ENGINE=comfyui"
-        echo "      - COMFYUI_BASE_URL=http://host.docker.internal:${COMFYUI_PORT}"
-        echo "      - IMAGES_EDIT_COMFYUI_BASE_URL=http://host.docker.internal:${COMFYUI_PORT}"
-        # WebUI's validate_url blocks private-IP URLs by default. Since ComfyUI runs
-        # on the host and its image URLs resolve to host.docker.internal (private IP),
-        # we must enable local web fetch so get_image_data can retrieve generated images.
-        echo "      - ENABLE_RAG_LOCAL_WEB_FETCH=true"
+        if [ "$IMAGE_GEN_BACKEND" = "drawthings" ]; then
+            # A1111-compatible proxy on host bridges Open WebUI to Draw Things.
+            echo "      - IMAGE_GENERATION_ENGINE=automatic1111"
+            echo "      - AUTOMATIC1111_BASE_URL=http://host.docker.internal:${DRAW_THINGS_PROXY_PORT}"
+        else
+            echo "      - IMAGE_GENERATION_ENGINE=comfyui"
+            echo "      - COMFYUI_BASE_URL=http://host.docker.internal:${COMFYUI_PORT}"
+            echo "      - IMAGES_EDIT_COMFYUI_BASE_URL=http://host.docker.internal:${COMFYUI_PORT}"
+            # validate_url blocks private-IP URLs by default; ComfyUI image URLs
+            # use host.docker.internal which resolves to a private IP.
+            echo "      - ENABLE_RAG_LOCAL_WEB_FETCH=true"
+        fi
     fi
 
     # ── ollama-proxy overrides (docker mode only) ──
@@ -395,7 +404,7 @@ else
 fi
 
 # ── Step 6: Start ComfyUI natively (image generation) ────────
-if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ -x "./start-comfyui.sh" ]; then
+if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ "$IMAGE_GEN_BACKEND" = "comfyui" ] && [ -x "./start-comfyui.sh" ]; then
     echo ""
     ./start-comfyui.sh || echo "Warning: ComfyUI failed to start — Open WebUI will run without image generation."
 fi
@@ -403,7 +412,7 @@ fi
 # ── Step 6b: Pre-load the SDXL model ─────────────────────────
 # Queue a 1-step 128×128 generation so the model is in RAM before the
 # first real request. curl returns immediately; ComfyUI loads async.
-if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && \
+if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ "$IMAGE_GEN_BACKEND" = "comfyui" ] && \
    curl -sf "http://127.0.0.1:${COMFYUI_PORT:-8188}/system_stats" > /dev/null 2>&1; then
     _warmup_model="${COMFYUI_DEFAULT_MODEL_NAME:-sd_xl_base_1.0.safetensors}"
     if curl -sf "http://127.0.0.1:${COMFYUI_PORT:-8188}/prompt" \
@@ -415,6 +424,49 @@ EOF
         echo "ComfyUI warmup queued — SDXL model loading in background."
     else
         echo "Warning: ComfyUI warmup failed — first image generation may be slow."
+    fi
+fi
+
+# ── Step 6c: Start Draw Things + A1111 proxy ─────────────────
+if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ "$IMAGE_GEN_BACKEND" = "drawthings" ]; then
+    echo ""
+    # Open Draw Things GUI app (its API server starts with the app).
+    if open -a "Draw Things" 2>/dev/null; then
+        echo "Draw Things launched."
+    else
+        echo "Warning: Draw Things not found — install it from the App Store."
+        echo "         Then enable: Settings → Advanced → API Server (port ${DRAW_THINGS_PORT})."
+    fi
+
+    # Start the A1111-compatible proxy shim.
+    PROXY_PID_FILE="$SCRIPT_DIR/logs/draw-things-proxy.pid"
+    mkdir -p "$SCRIPT_DIR/logs"
+    if [ -f "$PROXY_PID_FILE" ] && kill -0 "$(cat "$PROXY_PID_FILE")" 2>/dev/null; then
+        echo "Draw Things proxy already running (PID $(cat "$PROXY_PID_FILE"))."
+    else
+        DRAW_THINGS_URL="http://localhost:${DRAW_THINGS_PORT}" \
+        DRAW_THINGS_PROXY_PORT="${DRAW_THINGS_PROXY_PORT}" \
+        DRAW_THINGS_DEFAULT_MODEL="${DRAW_THINGS_DEFAULT_MODEL}" \
+        nohup python3 "$SCRIPT_DIR/draw-things-proxy.py" \
+            >> "$SCRIPT_DIR/logs/draw-things-proxy.log" 2>&1 &
+        echo $! > "$PROXY_PID_FILE"
+        echo "Draw Things proxy started (PID $!) on port ${DRAW_THINGS_PROXY_PORT}."
+    fi
+
+    # Wait up to 30 s for Draw Things API to become available.
+    echo "Waiting for Draw Things API on port ${DRAW_THINGS_PORT}..."
+    _dt_ready=false
+    for i in $(seq 1 15); do
+        if nc -z localhost "$DRAW_THINGS_PORT" 2>/dev/null; then
+            echo "Draw Things API ready."
+            _dt_ready=true
+            break
+        fi
+        sleep 2
+    done
+    if [ "$_dt_ready" = false ]; then
+        echo "Warning: Draw Things API not responding on port ${DRAW_THINGS_PORT}."
+        echo "         Make sure Draw Things is open and API Server is enabled."
     fi
 fi
 
@@ -432,11 +484,9 @@ echo "Stack is up. Services:"
 docker compose ps
 echo ""
 
-# ── Step 8: Patch ComfyUI workflow node_ids in WebUI DB ──────
-# Open WebUI seeds its default ComfyUI workflow with empty node_ids, so
-# prompt/model/size never get substituted into the workflow JSON. Result:
-# ComfyUI rejects every prompt with "ckpt_name: 'model.safetensors' not in
-# [...]". We patch the DB so the bundled workflow actually works.
+# ── Step 8: Patch image engine settings in WebUI DB ──────────
+# Open WebUI caches image engine config in a SQLite DB. We patch it to
+# match the active backend so users don't have to configure it manually.
 #
 # Sequence matters: WebUI caches PersistentConfig in memory and rewrites the
 # row on shutdown. So we must (1) wait for first-run DB init, (2) stop WebUI
@@ -449,9 +499,48 @@ if [ "$ENABLE_IMAGE_GENERATION" = "true" ]; then
         sleep 1
     done
 
-    # SDXL requires 1024x1024 — at WebUI's default 512x512, SDXL produces
-    # solid black images. We force the size alongside the node_ids fix.
-    NEEDS_PATCH=$(docker exec -i open-webui python - <<'PY' 2>/dev/null || echo "yes"
+    if [ "$IMAGE_GEN_BACKEND" = "drawthings" ]; then
+        NEEDS_PATCH=$(docker exec -i open-webui python3 - <<'PY' 2>/dev/null || echo "yes"
+import sqlite3, json
+row = sqlite3.connect('/app/backend/data/webui.db').cursor().execute(
+    "SELECT data FROM config ORDER BY id DESC LIMIT 1").fetchone()
+img = json.loads(row[0])['image_generation'] if row else {}
+engine_ok = img.get('engine') == 'automatic1111'
+size_ok = img.get('size') == '1024x1024'
+openai_ok = not (img.get('openai') or {}).get('api_base_url')
+print("no" if (engine_ok and size_ok and openai_ok) else "yes")
+PY
+        )
+        if [ "$NEEDS_PATCH" = "yes" ]; then
+            echo "Patching WebUI DB for Draw Things (automatic1111 engine)..."
+            WEBUI_VOLUME="$(docker volume ls --format '{{.Name}}' | grep -E '_webui-data$' | head -n1)"
+            docker compose kill open-webui >/dev/null 2>&1
+            docker compose rm -f open-webui >/dev/null 2>&1
+            docker run --rm -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
+import sqlite3, json
+db = sqlite3.connect('/data/webui.db')
+c = db.cursor()
+row = c.execute('SELECT id, data FROM config ORDER BY id DESC LIMIT 1').fetchone()
+cid, data = row[0], json.loads(row[1])
+img = data.setdefault('image_generation', {})
+img['engine'] = 'automatic1111'
+img['size'] = '1024x1024'
+img['openai'] = {}
+c.execute('UPDATE config SET data=? WHERE id=?', (json.dumps(data), cid))
+db.commit()
+" || echo "Warning: DB patch failed — set engine=automatic1111, size=1024x1024 manually in WebUI Settings → Images."
+            docker compose up -d open-webui >/dev/null 2>&1
+            for i in $(seq 1 30); do
+                if curl -sf "http://localhost:${WEBUI_PORT:-3000}/health" >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 1
+            done
+        fi
+    else
+        # comfyui: patch engine, model, size, and workflow node_ids.
+        # SDXL requires 1024x1024 — at WebUI's default 512x512 it produces black images.
+        NEEDS_PATCH=$(docker exec -i open-webui python3 - <<'PY' 2>/dev/null || echo "yes"
 import sqlite3, json
 row = sqlite3.connect('/app/backend/data/webui.db').cursor().execute(
     "SELECT data FROM config ORDER BY id DESC LIMIT 1").fetchone()
@@ -463,17 +552,15 @@ model_ok = img.get('model') == 'sd_xl_base_1.0.safetensors'
 openai_ok = not (img.get('openai') or {}).get('api_base_url')
 print("no" if (nodes_ok and size_ok and engine_ok and model_ok and openai_ok) else "yes")
 PY
-)
-    if [ "$NEEDS_PATCH" = "yes" ]; then
-        echo "Patching ComfyUI workflow + image size in WebUI..."
-        WEBUI_VOLUME="$(docker compose config --volumes | grep -E '^webui-data$' >/dev/null && \
-            docker volume ls --format '{{.Name}}' | grep -E '_webui-data$' | head -n1)"
-        # WebUI's PersistentConfig flushes in-memory state to the DB on graceful
-        # shutdown, which would clobber our patch. `kill` (SIGKILL) skips the
-        # flush so the DB stays quiescent for the rewrite.
-        docker compose kill open-webui >/dev/null 2>&1
-        docker compose rm -f open-webui >/dev/null 2>&1
-        docker run --rm -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
+        )
+        if [ "$NEEDS_PATCH" = "yes" ]; then
+            echo "Patching ComfyUI workflow + image size in WebUI..."
+            WEBUI_VOLUME="$(docker volume ls --format '{{.Name}}' | grep -E '_webui-data$' | head -n1)"
+            # WebUI's PersistentConfig flushes in-memory state to the DB on graceful
+            # shutdown, which would clobber our patch. `kill` (SIGKILL) skips the flush.
+            docker compose kill open-webui >/dev/null 2>&1
+            docker compose rm -f open-webui >/dev/null 2>&1
+            docker run --rm -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
 import sqlite3, json
 db = sqlite3.connect('/data/webui.db')
 c = db.cursor()
@@ -495,15 +582,14 @@ img.setdefault('comfyui', {})['nodes'] = [
 c.execute('UPDATE config SET data=? WHERE id=?', (json.dumps(data), cid))
 db.commit()
 " || echo "Warning: ComfyUI workflow patch failed — set engine=comfyui, model=sd_xl_base_1.0.safetensors, size 1024x1024 manually in WebUI Settings → Images."
-        docker compose up -d open-webui >/dev/null 2>&1
-        # Wait for WebUI to start serving again so users don't hit a transient
-        # 502 from Caddy if they reload during the patch window.
-        for i in $(seq 1 30); do
-            if curl -sf "http://localhost:${WEBUI_PORT:-3000}/health" >/dev/null 2>&1; then
-                break
-            fi
-            sleep 1
-        done
+            docker compose up -d open-webui >/dev/null 2>&1
+            for i in $(seq 1 30); do
+                if curl -sf "http://localhost:${WEBUI_PORT:-3000}/health" >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 1
+            done
+        fi
     fi
 fi
 echo ""
@@ -520,5 +606,10 @@ if [ "$OLLAMA_MODE" = "native" ]; then
     echo "Ollama:     running natively on your host (localhost:11434)"
 fi
 if [ "$ENABLE_IMAGE_GENERATION" = "true" ]; then
-    echo "ComfyUI:    running natively on your host (localhost:${COMFYUI_PORT})"
+    if [ "$IMAGE_GEN_BACKEND" = "drawthings" ]; then
+        echo "Draw Things: running natively on your host (localhost:${DRAW_THINGS_PORT})"
+        echo "DT Proxy:    A1111 shim on localhost:${DRAW_THINGS_PROXY_PORT} → Draw Things"
+    else
+        echo "ComfyUI:     running natively on your host (localhost:${COMFYUI_PORT})"
+    fi
 fi

@@ -44,7 +44,11 @@ fi
 set -a; source .env; set +a
 OLLAMA_MODE="${OLLAMA_MODE:-native}"
 ENABLE_IMAGE_GENERATION="${ENABLE_IMAGE_GENERATION:-true}"
+IMAGE_GEN_BACKEND="${IMAGE_GEN_BACKEND:-comfyui}"
 COMFYUI_PORT="${COMFYUI_PORT:-8188}"
+DRAW_THINGS_PORT="${DRAW_THINGS_PORT:-7860}"
+DRAW_THINGS_PROXY_PORT="${DRAW_THINGS_PROXY_PORT:-7861}"
+DRAW_THINGS_DEFAULT_MODEL="${DRAW_THINGS_DEFAULT_MODEL:-flux_1_dev_q4p.ckpt}"
 WEBUI_PORT="${WEBUI_PORT:-3000}"
 
 # ── Wait for Docker/Colima (up to 120 s) ────────────────────
@@ -80,12 +84,15 @@ if [ ! -f "$OVERRIDE" ]; then
         fi
         if [ "$ENABLE_IMAGE_GENERATION" = "true" ]; then
             echo "      - ENABLE_IMAGE_GENERATION=true"
-            echo "      - IMAGE_GENERATION_ENGINE=comfyui"
-            echo "      - COMFYUI_BASE_URL=http://host.docker.internal:${COMFYUI_PORT}"
-            echo "      - IMAGES_EDIT_COMFYUI_BASE_URL=http://host.docker.internal:${COMFYUI_PORT}"
-            # validate_url blocks private-IP URLs by default; ComfyUI image URLs
-            # use host.docker.internal which resolves to a private IP.
-            echo "      - ENABLE_RAG_LOCAL_WEB_FETCH=true"
+            if [ "$IMAGE_GEN_BACKEND" = "drawthings" ]; then
+                echo "      - IMAGE_GENERATION_ENGINE=automatic1111"
+                echo "      - AUTOMATIC1111_BASE_URL=http://host.docker.internal:${DRAW_THINGS_PROXY_PORT}"
+            else
+                echo "      - IMAGE_GENERATION_ENGINE=comfyui"
+                echo "      - COMFYUI_BASE_URL=http://host.docker.internal:${COMFYUI_PORT}"
+                echo "      - IMAGES_EDIT_COMFYUI_BASE_URL=http://host.docker.internal:${COMFYUI_PORT}"
+                echo "      - ENABLE_RAG_LOCAL_WEB_FETCH=true"
+            fi
         fi
         if [ "$OLLAMA_MODE" = "docker" ]; then
             echo "  ollama-proxy:"
@@ -106,6 +113,24 @@ else
 fi
 log "Docker stack up."
 
+# ── Start Draw Things + proxy (if drawthings backend) ────────
+if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ "$IMAGE_GEN_BACKEND" = "drawthings" ]; then
+    open -a "Draw Things" 2>/dev/null || log "Warning: Draw Things not found — install from App Store."
+
+    PROXY_PID_FILE="$SCRIPT_DIR/logs/draw-things-proxy.pid"
+    if [ -f "$PROXY_PID_FILE" ] && kill -0 "$(cat "$PROXY_PID_FILE")" 2>/dev/null; then
+        log "Draw Things proxy already running (PID $(cat "$PROXY_PID_FILE"))."
+    else
+        DRAW_THINGS_URL="http://localhost:${DRAW_THINGS_PORT}" \
+        DRAW_THINGS_PROXY_PORT="${DRAW_THINGS_PROXY_PORT}" \
+        DRAW_THINGS_DEFAULT_MODEL="${DRAW_THINGS_DEFAULT_MODEL}" \
+        nohup python3 "$SCRIPT_DIR/draw-things-proxy.py" \
+            >> "$SCRIPT_DIR/logs/draw-things-proxy.log" 2>&1 &
+        echo $! > "$PROXY_PID_FILE"
+        log "Draw Things proxy started (PID $!) on port ${DRAW_THINGS_PROXY_PORT}."
+    fi
+fi
+
 # ── Wait for WebUI to be healthy (up to 120 s) ───────────────
 log "Waiting for WebUI..."
 WEBUI_READY=false
@@ -122,7 +147,7 @@ if [ "$WEBUI_READY" = false ]; then
     exit 0
 fi
 
-# ── DB patch: ensure ComfyUI workflow + image settings ───────
+# ── DB patch: ensure image engine settings ───────────────────
 # Idempotent check — only patches when something is wrong/missing.
 if [ "$ENABLE_IMAGE_GENERATION" = "true" ]; then
     for i in $(seq 1 15); do
@@ -132,7 +157,48 @@ if [ "$ENABLE_IMAGE_GENERATION" = "true" ]; then
         sleep 1
     done
 
-    NEEDS_PATCH=$(docker exec -i open-webui python3 - <<'PY' 2>/dev/null || echo "yes"
+    if [ "$IMAGE_GEN_BACKEND" = "drawthings" ]; then
+        NEEDS_PATCH=$(docker exec -i open-webui python3 - <<'PY' 2>/dev/null || echo "yes"
+import sqlite3, json
+row = sqlite3.connect('/app/backend/data/webui.db').cursor().execute(
+    "SELECT data FROM config ORDER BY id DESC LIMIT 1").fetchone()
+img = json.loads(row[0])['image_generation'] if row else {}
+engine_ok = img.get('engine') == 'automatic1111'
+size_ok = img.get('size') == '1024x1024'
+openai_ok = not (img.get('openai') or {}).get('api_base_url')
+print("no" if (engine_ok and size_ok and openai_ok) else "yes")
+PY
+        )
+        if [ "$NEEDS_PATCH" = "yes" ]; then
+            log "Patching WebUI DB for Draw Things (automatic1111 engine)..."
+            WEBUI_VOLUME="$(docker volume ls --format '{{.Name}}' | grep -E '_webui-data$' | head -n1)"
+            docker compose kill open-webui >/dev/null 2>&1
+            docker compose rm -f open-webui >/dev/null 2>&1
+            docker run --rm -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
+import sqlite3, json
+db = sqlite3.connect('/data/webui.db')
+c = db.cursor()
+row = c.execute('SELECT id, data FROM config ORDER BY id DESC LIMIT 1').fetchone()
+cid, data = row[0], json.loads(row[1])
+img = data.setdefault('image_generation', {})
+img['engine'] = 'automatic1111'
+img['size'] = '1024x1024'
+img['openai'] = {}
+c.execute('UPDATE config SET data=? WHERE id=?', (json.dumps(data), cid))
+db.commit()
+" && log "DB patch applied." || log "Warning: DB patch failed — check manually."
+            docker compose up -d open-webui >/dev/null 2>&1
+            for i in $(seq 1 30); do
+                if curl -sf "http://localhost:${WEBUI_PORT}/health" >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 1
+            done
+        else
+            log "DB already patched — nothing to do."
+        fi
+    else
+        NEEDS_PATCH=$(docker exec -i open-webui python3 - <<'PY' 2>/dev/null || echo "yes"
 import sqlite3, json
 row = sqlite3.connect('/app/backend/data/webui.db').cursor().execute(
     "SELECT data FROM config ORDER BY id DESC LIMIT 1").fetchone()
@@ -144,14 +210,13 @@ model_ok = img.get('model') == 'sd_xl_base_1.0.safetensors'
 openai_ok = not (img.get('openai') or {}).get('api_base_url')
 print("no" if (nodes_ok and size_ok and engine_ok and model_ok and openai_ok) else "yes")
 PY
-    )
-
-    if [ "$NEEDS_PATCH" = "yes" ]; then
-        log "Patching WebUI DB (ComfyUI workflow + image settings)..."
-        WEBUI_VOLUME="$(docker volume ls --format '{{.Name}}' | grep -E '_webui-data$' | head -n1)"
-        docker compose kill open-webui >/dev/null 2>&1
-        docker compose rm -f open-webui >/dev/null 2>&1
-        docker run --rm -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
+        )
+        if [ "$NEEDS_PATCH" = "yes" ]; then
+            log "Patching WebUI DB (ComfyUI workflow + image settings)..."
+            WEBUI_VOLUME="$(docker volume ls --format '{{.Name}}' | grep -E '_webui-data$' | head -n1)"
+            docker compose kill open-webui >/dev/null 2>&1
+            docker compose rm -f open-webui >/dev/null 2>&1
+            docker run --rm -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
 import sqlite3, json
 db = sqlite3.connect('/data/webui.db')
 c = db.cursor()
@@ -173,20 +238,21 @@ img.setdefault('comfyui', {})['nodes'] = [
 c.execute('UPDATE config SET data=? WHERE id=?', (json.dumps(data), cid))
 db.commit()
 " && log "DB patch applied." || log "Warning: DB patch failed — check manually."
-        docker compose up -d open-webui >/dev/null 2>&1
-        for i in $(seq 1 30); do
-            if curl -sf "http://localhost:${WEBUI_PORT}/health" >/dev/null 2>&1; then
-                break
-            fi
-            sleep 1
-        done
-    else
-        log "DB already patched — nothing to do."
+            docker compose up -d open-webui >/dev/null 2>&1
+            for i in $(seq 1 30); do
+                if curl -sf "http://localhost:${WEBUI_PORT}/health" >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 1
+            done
+        else
+            log "DB already patched — nothing to do."
+        fi
     fi
 fi
 
 # ── ComfyUI warmup: pre-load SDXL so first request is fast ──
-if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && \
+if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ "$IMAGE_GEN_BACKEND" = "comfyui" ] && \
    curl -sf "http://127.0.0.1:${COMFYUI_PORT}/system_stats" >/dev/null 2>&1; then
     _warmup_model="${COMFYUI_DEFAULT_MODEL_NAME:-sd_xl_base_1.0.safetensors}"
     if curl -sf "http://127.0.0.1:${COMFYUI_PORT}/prompt" \
