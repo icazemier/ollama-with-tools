@@ -165,8 +165,9 @@ row = sqlite3.connect('/app/backend/data/webui.db').cursor().execute(
 img = json.loads(row[0])['image_generation'] if row else {}
 engine_ok = img.get('engine') == 'automatic1111'
 size_ok = img.get('size') == '1024x1024'
+url_ok = bool((img.get('automatic1111') or {}).get('base_url'))
 openai_ok = not (img.get('openai') or {}).get('api_base_url')
-print("no" if (engine_ok and size_ok and openai_ok) else "yes")
+print("no" if (engine_ok and size_ok and url_ok and openai_ok) else "yes")
 PY
         )
         if [ "$NEEDS_PATCH" = "yes" ]; then
@@ -184,6 +185,7 @@ img = data.setdefault('image_generation', {})
 img['engine'] = 'automatic1111'
 img['size'] = '1024x1024'
 img['openai'] = {}
+img.setdefault('automatic1111', {})['base_url'] = 'http://host.docker.internal:${DRAW_THINGS_PROXY_PORT}'
 c.execute('UPDATE config SET data=? WHERE id=?', (json.dumps(data), cid))
 db.commit()
 " && log "DB patch applied." || log "Warning: DB patch failed — check manually."
