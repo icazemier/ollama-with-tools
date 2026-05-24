@@ -17,13 +17,14 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-DRAW_THINGS_URL = os.environ.get("DRAW_THINGS_URL", "http://localhost:7860")
+DRAW_THINGS_URL = os.environ.get("DRAW_THINGS_URL", "http://127.0.0.1:7860")
 PROXY_PORT = int(os.environ.get("DRAW_THINGS_PROXY_PORT", "7861"))
-DEFAULT_MODEL = os.environ.get("DRAW_THINGS_DEFAULT_MODEL", "flux_1_dev_q4p.ckpt")
+DEFAULT_MODEL = os.environ.get("DRAW_THINGS_DEFAULT_MODEL", "flux_1_dev_q8p.ckpt")
 
 MODELS = [
-    {"title": "FLUX.1-dev Q4", "model_name": "flux_1_dev_q4p.ckpt"},
+    {"title": "FLUX.1-dev Q8", "model_name": "flux_1_dev_q8p.ckpt"},
     {"title": "FLUX.1-dev Q6", "model_name": "flux_1_dev_q6p.ckpt"},
+    {"title": "FLUX.1-dev Q4", "model_name": "flux_1_dev_q4p.ckpt"},
     {"title": "FLUX.1-schnell Q4", "model_name": "flux_1_schnell_q4p.ckpt"},
     {"title": "FLUX.1-schnell Q6", "model_name": "flux_1_schnell_q6p.ckpt"},
 ]

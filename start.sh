@@ -67,7 +67,7 @@ OLLAMA_MODE="${OLLAMA_MODE:-native}"
 IMAGE_GEN_BACKEND="${IMAGE_GEN_BACKEND:-comfyui}"
 DRAW_THINGS_PORT="${DRAW_THINGS_PORT:-7860}"
 DRAW_THINGS_PROXY_PORT="${DRAW_THINGS_PROXY_PORT:-7861}"
-DRAW_THINGS_DEFAULT_MODEL="${DRAW_THINGS_DEFAULT_MODEL:-flux_1_dev_q4p.ckpt}"
+DRAW_THINGS_DEFAULT_MODEL="${DRAW_THINGS_DEFAULT_MODEL:-flux_1_dev_q8p.ckpt}"
 
 # ── Container engine (Colima) — patch daemon config ────────
 # Colima's default Docker daemon config enables the containerd snapshotter,
@@ -444,7 +444,7 @@ if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ "$IMAGE_GEN_BACKEND" = "drawthin
     if [ -f "$PROXY_PID_FILE" ] && kill -0 "$(cat "$PROXY_PID_FILE")" 2>/dev/null; then
         echo "Draw Things proxy already running (PID $(cat "$PROXY_PID_FILE"))."
     else
-        DRAW_THINGS_URL="http://localhost:${DRAW_THINGS_PORT}" \
+        DRAW_THINGS_URL="http://127.0.0.1:${DRAW_THINGS_PORT}" \
         DRAW_THINGS_PROXY_PORT="${DRAW_THINGS_PROXY_PORT}" \
         DRAW_THINGS_DEFAULT_MODEL="${DRAW_THINGS_DEFAULT_MODEL}" \
         nohup python3 "$SCRIPT_DIR/draw-things-proxy.py" \
