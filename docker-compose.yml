@@ -92,7 +92,7 @@ services:
       - DO_NOT_TRACK=true
       - ANONYMIZED_TELEMETRY=false
       - ENABLE_UPDATE_CHECK=false
-      - WEBUI_AUTH=false
+      - WEBUI_AUTH=true
     deploy:
       resources:
         limits:

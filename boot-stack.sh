@@ -43,6 +43,7 @@ fi
 
 set -a; source .env; set +a
 OLLAMA_MODE="${OLLAMA_MODE:-native}"
+OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-30s}"
 ENABLE_IMAGE_GENERATION="${ENABLE_IMAGE_GENERATION:-true}"
 IMAGE_GEN_BACKEND="${IMAGE_GEN_BACKEND:-comfyui}"
 COMFYUI_PORT="${COMFYUI_PORT:-8188}"
@@ -200,42 +201,72 @@ db.commit()
             log "DB already patched — nothing to do."
         fi
     else
+        # comfyui: same FLUX.1-dev GGUF workflow as start.sh — keep in sync.
         NEEDS_PATCH=$(docker exec -i open-webui python3 - <<'PY' 2>/dev/null || echo "yes"
 import sqlite3, json
 row = sqlite3.connect('/app/backend/data/webui.db').cursor().execute(
     "SELECT data FROM config ORDER BY id DESC LIMIT 1").fetchone()
 img = json.loads(row[0])['image_generation'] if row else {}
-nodes_ok = any(n.get('node_ids') for n in img.get('comfyui', {}).get('nodes', []))
+nodes_ok = any(n.get('key') == 'unet_name' for n in img.get('comfyui', {}).get('nodes', []))
 size_ok = img.get('size') == '1024x1024'
 engine_ok = (img.get('engine') or 'comfyui') == 'comfyui'
-model_ok = img.get('model') == 'sd_xl_base_1.0.safetensors'
+model_ok = img.get('model') == 'flux1-dev-Q4_K_S.gguf'
 openai_ok = not (img.get('openai') or {}).get('api_base_url')
-print("no" if (nodes_ok and size_ok and engine_ok and model_ok and openai_ok) else "yes")
+try:
+    wf = json.loads(img.get('comfyui', {}).get('workflow') or '{}')
+    workflow_ok = wf.get('4', {}).get('class_type') == 'UnetLoaderGGUF'
+except Exception:
+    workflow_ok = False
+print("no" if (nodes_ok and size_ok and engine_ok and model_ok and openai_ok and workflow_ok) else "yes")
 PY
         )
         if [ "$NEEDS_PATCH" = "yes" ]; then
-            log "Patching WebUI DB (ComfyUI workflow + image settings)..."
+            log "Patching WebUI DB (ComfyUI FLUX workflow + image settings)..."
             WEBUI_VOLUME="$(docker volume ls --format '{{.Name}}' | grep -E '_webui-data$' | head -n1)"
             docker compose kill open-webui >/dev/null 2>&1
             docker compose rm -f open-webui >/dev/null 2>&1
             docker run --rm -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
 import sqlite3, json
+FLUX_WORKFLOW = {
+    '3':  {'class_type': 'KSampler', 'inputs': {
+        'seed': 0, 'steps': 20, 'cfg': 1.0,
+        'sampler_name': 'euler', 'scheduler': 'simple', 'denoise': 1.0,
+        'model': ['4', 0], 'positive': ['12', 0], 'negative': ['7', 0],
+        'latent_image': ['5', 0],
+    }},
+    '4':  {'class_type': 'UnetLoaderGGUF',     'inputs': {'unet_name': 'flux1-dev-Q4_K_S.gguf'}},
+    '5':  {'class_type': 'EmptySD3LatentImage','inputs': {'width': 1024, 'height': 1024, 'batch_size': 1}},
+    '6':  {'class_type': 'CLIPTextEncode',     'inputs': {'text': '', 'clip': ['11', 0]}},
+    '7':  {'class_type': 'CLIPTextEncode',     'inputs': {'text': '', 'clip': ['11', 0]}},
+    '8':  {'class_type': 'VAEDecode',          'inputs': {'samples': ['3', 0], 'vae': ['10', 0]}},
+    '9':  {'class_type': 'SaveImage',          'inputs': {'filename_prefix': 'Flux', 'images': ['8', 0]}},
+    '10': {'class_type': 'VAELoader',          'inputs': {'vae_name': 'ae.safetensors'}},
+    '11': {'class_type': 'DualCLIPLoader',     'inputs': {
+        'clip_name1': 't5xxl_fp8_e4m3fn.safetensors',
+        'clip_name2': 'clip_l.safetensors',
+        'type': 'flux',
+    }},
+    '12': {'class_type': 'FluxGuidance',       'inputs': {'conditioning': ['6', 0], 'guidance': 3.5}},
+}
 db = sqlite3.connect('/data/webui.db')
 c = db.cursor()
 row = c.execute('SELECT id, data FROM config ORDER BY id DESC LIMIT 1').fetchone()
 cid, data = row[0], json.loads(row[1])
 img = data.setdefault('image_generation', {})
 img['engine'] = 'comfyui'
-img['model'] = 'sd_xl_base_1.0.safetensors'
+img['model'] = 'flux1-dev-Q4_K_S.gguf'
 img['size'] = '1024x1024'
+img['steps'] = 20
 img['openai'] = {}
-img.setdefault('comfyui', {})['nodes'] = [
-    {'type': 'prompt',   'key': 'text',      'node_ids': ['6']},
-    {'type': 'model',    'key': 'ckpt_name', 'node_ids': ['4']},
-    {'type': 'width',    'key': 'width',     'node_ids': ['5']},
-    {'type': 'height',   'key': 'height',    'node_ids': ['5']},
-    {'type': 'steps',    'key': 'steps',     'node_ids': ['3']},
-    {'type': 'seed',     'key': 'seed',      'node_ids': ['3']},
+cfg = img.setdefault('comfyui', {})
+cfg['workflow'] = json.dumps(FLUX_WORKFLOW)
+cfg['nodes'] = [
+    {'type': 'prompt',   'key': 'text',       'node_ids': ['6']},
+    {'type': 'model',    'key': 'unet_name',  'node_ids': ['4']},
+    {'type': 'width',    'key': 'width',      'node_ids': ['5']},
+    {'type': 'height',   'key': 'height',     'node_ids': ['5']},
+    {'type': 'steps',    'key': 'steps',      'node_ids': ['3']},
+    {'type': 'seed',     'key': 'seed',       'node_ids': ['3']},
 ]
 c.execute('UPDATE config SET data=? WHERE id=?', (json.dumps(data), cid))
 db.commit()
@@ -253,17 +284,16 @@ db.commit()
     fi
 fi
 
-# ── ComfyUI warmup: pre-load SDXL so first request is fast ──
+# ── ComfyUI warmup: pre-load FLUX so first request is fast ──
 if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ "$IMAGE_GEN_BACKEND" = "comfyui" ] && \
    curl -sf "http://127.0.0.1:${COMFYUI_PORT}/system_stats" >/dev/null 2>&1; then
-    _warmup_model="${COMFYUI_DEFAULT_MODEL_NAME:-sd_xl_base_1.0.safetensors}"
     if curl -sf "http://127.0.0.1:${COMFYUI_PORT}/prompt" \
             -H "Content-Type: application/json" \
-            --data-binary @- >/dev/null 2>&1 <<EOF
-{"prompt":{"4":{"class_type":"CheckpointLoaderSimple","inputs":{"ckpt_name":"${_warmup_model}"}},"5":{"class_type":"EmptyLatentImage","inputs":{"width":128,"height":128,"batch_size":1}},"6":{"class_type":"CLIPTextEncode","inputs":{"text":"warmup","clip":["4",1]}},"7":{"class_type":"CLIPTextEncode","inputs":{"text":"","clip":["4",1]}},"3":{"class_type":"KSampler","inputs":{"seed":1,"steps":1,"cfg":1,"sampler_name":"euler","scheduler":"normal","denoise":1,"model":["4",0],"positive":["6",0],"negative":["7",0],"latent_image":["5",0]}},"8":{"class_type":"VAEDecode","inputs":{"samples":["3",0],"vae":["4",2]}},"9":{"class_type":"SaveImage","inputs":{"filename_prefix":"warmup","images":["8",0]}}}}
+            --data-binary @- >/dev/null 2>&1 <<'EOF'
+{"prompt":{"3":{"class_type":"KSampler","inputs":{"seed":1,"steps":1,"cfg":1.0,"sampler_name":"euler","scheduler":"simple","denoise":1.0,"model":["4",0],"positive":["12",0],"negative":["7",0],"latent_image":["5",0]}},"4":{"class_type":"UnetLoaderGGUF","inputs":{"unet_name":"flux1-dev-Q4_K_S.gguf"}},"5":{"class_type":"EmptySD3LatentImage","inputs":{"width":256,"height":256,"batch_size":1}},"6":{"class_type":"CLIPTextEncode","inputs":{"text":"warmup","clip":["11",0]}},"7":{"class_type":"CLIPTextEncode","inputs":{"text":"","clip":["11",0]}},"8":{"class_type":"VAEDecode","inputs":{"samples":["3",0],"vae":["10",0]}},"9":{"class_type":"SaveImage","inputs":{"filename_prefix":"warmup","images":["8",0]}},"10":{"class_type":"VAELoader","inputs":{"vae_name":"ae.safetensors"}},"11":{"class_type":"DualCLIPLoader","inputs":{"clip_name1":"t5xxl_fp8_e4m3fn.safetensors","clip_name2":"clip_l.safetensors","type":"flux"}},"12":{"class_type":"FluxGuidance","inputs":{"conditioning":["6",0],"guidance":3.5}}}}
 EOF
     then
-        log "ComfyUI warmup queued."
+        log "ComfyUI warmup queued (FLUX)."
     else
         log "Warning: ComfyUI warmup failed — first image request may be slow."
     fi

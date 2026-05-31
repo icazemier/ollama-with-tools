@@ -22,8 +22,16 @@ COMFYUI_DIR="${COMFYUI_DIR:-$HOME/ComfyUI}"
 COMFYUI_PORT="${COMFYUI_PORT:-8188}"
 COMFYUI_LOG="${COMFYUI_LOG:-$COMFYUI_DIR/comfyui.log}"
 COMFYUI_PYTHON="${COMFYUI_PYTHON:-python3.12}"
-COMFYUI_DEFAULT_MODEL_URL="${COMFYUI_DEFAULT_MODEL_URL:-https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors}"
-COMFYUI_DEFAULT_MODEL_NAME="${COMFYUI_DEFAULT_MODEL_NAME:-sd_xl_base_1.0.safetensors}"
+
+# FLUX.1-dev GGUF asset set — auto-downloaded on first run (~12 GB total).
+# Each entry: "<path-under-ComfyUI>|<download URL>".
+# To skip auto-download entirely: touch "$COMFYUI_DIR/models/.skip_flux_download"
+FLUX_ASSETS=(
+    "models/unet/flux1-dev-Q4_K_S.gguf|https://huggingface.co/city96/FLUX.1-dev-gguf/resolve/main/flux1-dev-Q4_K_S.gguf"
+    "models/clip/clip_l.safetensors|https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors"
+    "models/clip/t5xxl_fp8_e4m3fn.safetensors|https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors"
+    "models/vae/ae.safetensors|https://huggingface.co/Comfy-Org/Lumina_Image_2.0_Repackaged/resolve/main/split_files/vae/ae.safetensors"
+)
 
 PLIST_LABEL="local.comfyui.server"
 PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
@@ -143,13 +151,32 @@ if ! python -c "import comfy" 2>/dev/null && [ ! -f "$COMFYUI_DIR/.deps_installe
     touch "$COMFYUI_DIR/.deps_installed"
 fi
 
-# ── Bootstrap: download default checkpoint ───────────────────
-CKPT_DIR="$COMFYUI_DIR/models/checkpoints"
-mkdir -p "$CKPT_DIR"
-if [ ! -f "$CKPT_DIR/$COMFYUI_DEFAULT_MODEL_NAME" ] && [ ! -f "$CKPT_DIR/.skip_default" ]; then
-    echo "Downloading default checkpoint ($COMFYUI_DEFAULT_MODEL_NAME, ~6.5 GB)..."
-    echo "This is a one-time download. Skip with: touch $CKPT_DIR/.skip_default"
-    curl -L -o "$CKPT_DIR/$COMFYUI_DEFAULT_MODEL_NAME" "$COMFYUI_DEFAULT_MODEL_URL"
+# ── Bootstrap: install ComfyUI-GGUF custom node ──────────────
+# Required to load FLUX.1-dev GGUF quantized UNets. Pulls in `gguf`,
+# `sentencepiece`, `protobuf` into the venv.
+if [ ! -d "$COMFYUI_DIR/custom_nodes/ComfyUI-GGUF" ]; then
+    echo "Installing ComfyUI-GGUF custom node (city96/ComfyUI-GGUF)..."
+    git clone --quiet https://github.com/city96/ComfyUI-GGUF.git \
+        "$COMFYUI_DIR/custom_nodes/ComfyUI-GGUF"
+    pip install --quiet -r "$COMFYUI_DIR/custom_nodes/ComfyUI-GGUF/requirements.txt"
+fi
+
+# ── Bootstrap: download FLUX.1-dev model assets ──────────────
+# ~12 GB across four files (UNet GGUF + CLIP-L + T5-XXL FP8 + VAE).
+# Idempotent: skips any file already present. Skip the whole block with:
+#   touch "$COMFYUI_DIR/models/.skip_flux_download"
+mkdir -p "$COMFYUI_DIR/models"
+if [ ! -f "$COMFYUI_DIR/models/.skip_flux_download" ]; then
+    for entry in "${FLUX_ASSETS[@]}"; do
+        rel="${entry%%|*}"
+        url="${entry##*|}"
+        full="$COMFYUI_DIR/$rel"
+        if [ ! -f "$full" ]; then
+            mkdir -p "$(dirname "$full")"
+            echo "Downloading $(basename "$full")..."
+            curl -L --fail --retry 3 -C - -o "$full" "$url"
+        fi
+    done
 fi
 
 # ── Start the server ─────────────────────────────────────────

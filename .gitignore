@@ -3,6 +3,7 @@ workspace/
 docker-compose.override.yml
 certs/
 *.log
+logs/
 .claude/
 backups/
 /tmp/openwebui.tar

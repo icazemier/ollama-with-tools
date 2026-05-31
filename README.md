@@ -16,9 +16,14 @@ installed. Then:
 Open **https://localhost** — you now have a local ChatGPT (with image
 generation, mic, camera). HTTP fallback at http://localhost:3000.
 
-> First run takes a while (downloads Ollama LLM ~9 GB, SDXL ~6.5 GB, ComfyUI
-> Python deps ~2 GB). After that, `./start.sh` takes seconds and works fully
-> offline.
+On first visit you'll be asked to create an account; that account becomes
+the admin. More users can be added from **Admin Panel → Users**. See
+[Authentication](#authentication) for self-signup, role defaults, and how
+to disable the login screen.
+
+> First run takes a while (downloads Ollama LLM ~9 GB, FLUX.1-dev Q4_K_S GGUF
+> stack ~12 GB, ComfyUI Python deps ~2 GB). After that, `./start.sh` takes
+> seconds and works fully offline.
 
 ## Use it in VS Code
 
@@ -141,6 +146,38 @@ ENABLE_IMAGE_GENERATION=true   # Auto-start ComfyUI with the stack
 COMFYUI_PORT=8188
 ```
 
+### Authentication
+
+Open WebUI runs with `WEBUI_AUTH=true` in `docker-compose.yml`, so a real
+login screen guards the UI. On the very first page load after a fresh
+install, the first account you create becomes the admin; subsequent users
+are added from **Admin Panel → Users**.
+
+- Sign-out genuinely logs you out (you land on `/auth`, not back in chat).
+- Each user has their own chat history, settings, models, and files —
+  switching accounts in a different browser/profile gives a clean inbox.
+- Self-signup is off by default. To open it up for LAN guests, set
+  `ENABLE_SIGNUP=true` in the WebUI environment and optionally
+  `DEFAULT_USER_ROLE=user` to skip the admin-approval step.
+- Sessions survive container restarts because the JWT signing key is
+  persisted on the `webui-data` volume.
+
+To temporarily switch back to the original single-user / no-login mode,
+flip `WEBUI_AUTH=false` in `docker-compose.yml` and recreate the
+`open-webui` container. Existing user accounts stay in the DB but become
+unreachable until auth is re-enabled.
+
+### Ollama keep-alive (FLUX OOM mitigation)
+
+```env
+OLLAMA_KEEP_ALIVE=30s   # Evict chat model from GPU 30 s after last request
+```
+
+On 16 GB unified memory the loaded chat model and a FLUX sample can't both
+sit on the GPU at once. See [Memory notes](#memory-notes) for the full
+diagnosis. `start.sh` propagates this value into the Ollama launchd plist
+on every run.
+
 ## Choosing AI models
 
 Edit `models.conf` to pick which models to use, then run `./start.sh` — new models are downloaded automatically.
@@ -179,16 +216,26 @@ WebUI runs in Docker and reaches both via `host.docker.internal`.
 ### What's included by default
 
 - **Backend:** ComfyUI (latest), auto-installed at `~/ComfyUI` on first run
-- **Model:** Stable Diffusion XL Base 1.0 (~6.5 GB), auto-downloaded on first run
+- **Custom node:** [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF),
+  auto-cloned so ComfyUI can load GGUF-quantized UNets
+- **Model:** FLUX.1-dev Q4_K_S GGUF (~6.5 GB UNet) plus its text encoders
+  (CLIP-L ~250 MB, T5-XXL FP8 ~4.9 GB) and VAE (~335 MB) — **~12 GB total**,
+  all auto-downloaded on first run
 - **Python:** ComfyUI uses its own Python 3.12 venv at `~/ComfyUI/venv`
   (PyTorch + dependencies are installed automatically)
 - **Auto-start:** wired into `./start.sh` and `./stop.sh`
 - **Disable:** set `ENABLE_IMAGE_GENERATION=false` in `.env`
 
 On a fresh Mac, `./start.sh` does everything — clones ComfyUI, builds the
-venv, installs PyTorch with MPS, downloads SDXL, then starts the server.
-First run takes ~10–15 minutes (mostly the SDXL download). Subsequent runs
-are instant.
+venv, installs PyTorch with MPS, installs the GGUF custom node, downloads
+the four FLUX assets, then starts the server. First run takes ~15–25 minutes
+(mostly the FLUX downloads). Subsequent runs are instant.
+
+> **Why FLUX.1-dev Q4_K_S?** It's the largest/best-quality FLUX-dev quant that
+> fits on a 16 GB Apple Silicon Mac alongside Ollama. Unquantized FLUX-dev
+> needs 24+ GB; the Q4_K_S GGUF runs in ~6.5 GB and produces images that are
+> a clear step up from SDXL. Expect 3–6 min per 1024×1024 image, longer if
+> Ollama is sharing memory.
 
 ### How to use it in Open WebUI
 
@@ -215,24 +262,25 @@ You don't need to open ComfyUI's own UI. It just runs as an API. If you ever
 want full workflow control (LoRAs, ControlNet, custom workflows), it lives at
 http://localhost:8188.
 
-### Prompt tips for SDXL
+### Prompt tips for FLUX
 
-SDXL responds best to **comma-separated descriptive phrases**, not full
-sentences:
-
-```
-cyberpunk cat, neon-lit alley, rain, glowing eyes, cinematic lighting,
-shallow depth of field, photorealistic, 8k, highly detailed
-```
-
-A useful **negative prompt** (set in image settings):
+FLUX is the opposite of SDXL on prompts. It was trained on natural-language
+captions (via the T5 text encoder), so **full sentences with concrete
+detail beat comma-separated tag soup**:
 
 ```
-blurry, lowres, bad anatomy, watermark, text, jpeg artifacts
+A serene mountain lake at golden hour, mist rising off the water, a single
+small wooden rowboat near the far shore, dense pine forest on the hills
+behind, cinematic photograph, shallow depth of field.
 ```
 
-`./start.sh` queues a warmup generation at startup so the SDXL model is
-already in MPS memory when you first use the chat. All images: ~15–25s.
+You can still drop adjectives in a list, but FLUX rewards specificity over
+keyword stuffing. **Negative prompts are mostly inert** for FLUX-dev (it's
+distilled with `cfg=1`), so leave the negative blank unless you have a
+specific reason.
+
+`./start.sh` queues a tiny 1-step warmup at startup so the GGUF UNet + T5
+text encoder are already in MPS memory when you first use the chat.
 
 ### Editing existing images
 
@@ -241,42 +289,57 @@ WebUI's image edit feature is also wired to ComfyUI via the
 upload or generate an image, click the **edit icon**, paint a mask over the
 area you want to change, and describe what should appear there.
 
-Editing uses the **same SDXL Base model** via ComfyUI's mask-aware inpainting
-workflow (`VAEEncodeForInpaint`). No separate inpainting checkpoint is
-installed — the practical SDXL inpainting models on Hugging Face are either
-gated, NSFW-only, or shipped only in multi-file diffusers format that doesn't
-drop into WebUI's default edit workflow. Quality with the base model is decent
-for masked edits, not great.
-
-If you want substantially better editing later, the right upgrade is
-**FLUX.1 Kontext** (instruction-style editing — "make the cat blue and add a
-hat" — no mask needed). It needs ~12 GB peak RAM, so plan to swap out Ollama
-or use a smaller LLM during editing sessions.
+Note: the default workflow used by `./start.sh` is text-to-image. Mask-aware
+inpainting with FLUX requires a different workflow (FLUX.1 Fill or a custom
+inpainting graph). That's not wired up by default — quality with the
+text-to-image workflow used as inpainting is hit-or-miss. If you need real
+inpainting, the upgrade path is **FLUX.1 Fill** (a separate ~6.6 GB GGUF
+quant from city96) or **FLUX.1 Kontext** (instruction-style edits without
+a mask).
 
 ### Memory notes
 
 On a 16 GB Mac:
 - macOS uses ~4 GB
-- Ollama with a 14B model uses ~9 GB
-- SDXL needs ~6 GB peak
+- Ollama with a 14B model uses ~11 GB resident on the GPU
+- FLUX peak: UNet (Q4_K_S) ~6.5 GB + T5-XXL FP8 ~5 GB + VAE/CLIP-L ~0.6 GB ≈ 12 GB
 
-That's tight — macOS unified memory will page when both are loaded. It works,
-just expect first-image latency. To stay snappy, either use a smaller Ollama
-model (e.g. `qwen2.5-coder:7b`) when generating images, or unload Ollama with
-`ollama stop <model>` before a heavy image session.
+These can't all be resident at once. Worse, on Apple Silicon an in-flight
+FLUX sample will OOM hard if Ollama is parked on the GPU — Metal aborts the
+command buffer (`kIOGPUCommandBufferCallbackErrorOutOfMemory`), the sampler
+keeps "progressing" through NaN tensors, and the VAE decodes a uniform
+noise grid instead of an image.
 
-### Adding more models
+The stack mitigates this by evicting Ollama from GPU memory aggressively:
 
-Drop any `.safetensors` checkpoint into `~/ComfyUI/models/checkpoints/`, then
-pick it from the model dropdown in WebUI's image settings. Newer options worth
-trying (with their RAM trade-offs):
+- **`OLLAMA_KEEP_ALIVE=30s`** in `.env` — after the last chat request the
+  loaded model is unloaded after 30 s, freeing ~11 GB for FLUX. Pay a one-time
+  ~5–10 s reload tax the next time you chat; generation speed itself is
+  unaffected. Tune higher if you don't use image gen often; tune lower if you
+  want even more aggressive eviction.
+- The value is wired through to `~/Library/LaunchAgents/local.ollama.server.plist`
+  by `start.sh` (re-run it after editing `.env` to apply changes).
 
-| Model | Size | Notes |
+If you still see noise-grid output, manually unload Ollama with
+`ollama stop <model>` and retry — or swap to a smaller Ollama model
+(`qwen2.5-coder:7b`, ~5 GB) so the two can coexist.
+
+### Swapping the FLUX quant
+
+To trade quality against memory/speed, pick a different
+[city96/FLUX.1-dev-gguf](https://huggingface.co/city96/FLUX.1-dev-gguf) quant
+and drop it into `~/ComfyUI/models/unet/`. Quants on this hardware:
+
+| Quant | UNet size | Notes |
 |---|---|---|
-| **SDXL Base 1.0** | ~6.5 GB | Default. Open license. Reliable. |
-| **SD 3.5 Medium** | ~5 GB | Newer, smaller. Requires HF token (license accept). |
-| **FLUX.1 schnell** | ~12 GB | Best quality, Apache 2.0, 4-step inference. Tight on 16 GB alongside Ollama. |
-| **FLUX.1 dev** | ~24 GB | Top quality. Non-commercial license. Requires 32+ GB RAM. |
+| **Q2_K** | ~4 GB | Smallest. Visible quality loss but fastest, leaves memory for Ollama. |
+| **Q4_K_S** | ~6.5 GB | **Default.** Best quality-per-byte balance for 16 GB. |
+| **Q5_K_S** | ~8.3 GB | Sharper detail, tighter on memory with Ollama loaded. |
+| **Q8_0** | ~12.7 GB | Near-FP16 quality, won't co-exist with Ollama 14B. |
+
+After dropping a new file in, also update the `unet_name` reference in
+`start.sh` (WebUI DB patch + warmup workflow) and `boot-stack.sh`, or just
+edit it in **WebUI → Admin → Settings → Images → Default Model**.
 
 ## LAN access
 
@@ -346,7 +409,7 @@ Other supported engines (you don't have to use Colima):
 - [Ollama](https://ollama.com/download) installed (native mode runs it on the host)
 - [mkcert](https://github.com/FiloSottile/mkcert) for local TLS (`brew install mkcert && mkcert -install`)
 - At least **16 GB of RAM** (LLM + image gen are tight at this size, see Memory notes above)
-- At least **30 GB of free disk space** (LLM ~9 GB, SDXL ~6.5 GB, ComfyUI deps ~2 GB, headroom)
+- At least **35 GB of free disk space** (LLM ~9 GB, FLUX assets ~12 GB, ComfyUI deps ~2 GB, headroom)
 
 ## File overview
 
@@ -377,10 +440,15 @@ In native mode (default), Ollama uses Metal — it should be fast. If it isn't,
 check the active model with `ollama ps` and try a smaller one. In docker mode,
 Ollama is CPU-only and will be slow on macOS.
 
-**Out of memory**
-Use a smaller LLM in `models.conf`, or stop Ollama (`ollama stop <model>`)
-before generating images. macOS unified memory pages between Ollama and
-ComfyUI when both are loaded on a 16 GB machine.
+**Out of memory / FLUX produces a noise grid instead of an image**
+On 16 GB Macs, an Ollama chat model parked on the GPU collides with the
+FLUX sample → MPS aborts mid-step with
+`kIOGPUCommandBufferCallbackErrorOutOfMemory` (visible in
+`~/ComfyUI/comfyui.log`), the sampler runs to completion on NaN tensors,
+and you get a flat noise grid. Mitigated by `OLLAMA_KEEP_ALIVE=30s` in
+`.env` — see [Ollama keep-alive](#ollama-keep-alive-flux-oom-mitigation)
+and [Memory notes](#memory-notes). If it still happens, `ollama stop
+<model>` before triggering image gen, or pick a smaller chat model.
 
 **Port 443 already in use**
 Another service is bound to HTTPS. Either stop it, or change `WEBUI_SSL_PORT`
