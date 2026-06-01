@@ -201,9 +201,31 @@ db.commit()
             log "DB already patched — nothing to do."
         fi
     else
+        # Validate FLUX_LORA_NAME — see start.sh for full rationale. Only allow
+        # .safetensors (load-only, no code execution) and require the file to
+        # actually exist under loras/. Refuse legacy pickle formats outright.
+        if [ -n "${FLUX_LORA_NAME:-}" ]; then
+            _lora_dir="${COMFYUI_DIR:-$HOME/ComfyUI}/models/loras"
+            _lora_lower="$(printf '%s' "$FLUX_LORA_NAME" | tr '[:upper:]' '[:lower:]')"
+            case "$_lora_lower" in
+                *.safetensors) : ;;
+                *)
+                    log "WARN: FLUX_LORA_NAME='${FLUX_LORA_NAME}' is not a .safetensors file — refusing to load (legacy pickle formats can execute arbitrary code). Ignoring."
+                    FLUX_LORA_NAME=""
+                    ;;
+            esac
+            if [ -n "${FLUX_LORA_NAME:-}" ] && [ ! -f "${_lora_dir}/${FLUX_LORA_NAME}" ]; then
+                log "WARN: FLUX_LORA_NAME='${FLUX_LORA_NAME}' not found at ${_lora_dir}/. Ignoring."
+                FLUX_LORA_NAME=""
+            fi
+            unset _lora_dir _lora_lower
+        fi
         # comfyui: same FLUX.1-dev GGUF workflow as start.sh — keep in sync.
-        NEEDS_PATCH=$(docker exec -i open-webui python3 - <<'PY' 2>/dev/null || echo "yes"
-import sqlite3, json
+        NEEDS_PATCH=$(docker exec -i \
+            -e "FLUX_LORA_NAME=${FLUX_LORA_NAME:-}" \
+            -e "FLUX_LORA_STRENGTH=${FLUX_LORA_STRENGTH:-0.8}" \
+            open-webui python3 - <<'PY' 2>/dev/null || echo "yes"
+import sqlite3, json, os
 row = sqlite3.connect('/app/backend/data/webui.db').cursor().execute(
     "SELECT data FROM config ORDER BY id DESC LIMIT 1").fetchone()
 img = json.loads(row[0])['image_generation'] if row else {}
@@ -212,12 +234,21 @@ size_ok = img.get('size') == '1024x1024'
 engine_ok = (img.get('engine') or 'comfyui') == 'comfyui'
 model_ok = img.get('model') == 'flux1-dev-Q4_K_S.gguf'
 openai_ok = not (img.get('openai') or {}).get('api_base_url')
+prompt_passthru_ok = (img.get('prompt') or {}).get('enable') is False
+lora_name = os.environ.get('FLUX_LORA_NAME', '').strip()
 try:
     wf = json.loads(img.get('comfyui', {}).get('workflow') or '{}')
     workflow_ok = wf.get('4', {}).get('class_type') == 'UnetLoaderGGUF'
+    if lora_name:
+        n13 = wf.get('13', {})
+        lora_ok = (n13.get('class_type') == 'LoraLoaderModelOnly'
+                   and n13.get('inputs', {}).get('lora_name') == lora_name)
+    else:
+        lora_ok = '13' not in wf
+    workflow_ok = workflow_ok and lora_ok
 except Exception:
     workflow_ok = False
-print("no" if (nodes_ok and size_ok and engine_ok and model_ok and openai_ok and workflow_ok) else "yes")
+print("no" if (nodes_ok and size_ok and engine_ok and model_ok and openai_ok and workflow_ok and prompt_passthru_ok) else "yes")
 PY
         )
         if [ "$NEEDS_PATCH" = "yes" ]; then
@@ -225,8 +256,11 @@ PY
             WEBUI_VOLUME="$(docker volume ls --format '{{.Name}}' | grep -E '_webui-data$' | head -n1)"
             docker compose kill open-webui >/dev/null 2>&1
             docker compose rm -f open-webui >/dev/null 2>&1
-            docker run --rm -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
-import sqlite3, json
+            docker run --rm \
+                -e "FLUX_LORA_NAME=${FLUX_LORA_NAME:-}" \
+                -e "FLUX_LORA_STRENGTH=${FLUX_LORA_STRENGTH:-0.8}" \
+                -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
+import sqlite3, json, os
 FLUX_WORKFLOW = {
     '3':  {'class_type': 'KSampler', 'inputs': {
         'seed': 0, 'steps': 20, 'cfg': 1.0,
@@ -248,6 +282,24 @@ FLUX_WORKFLOW = {
     }},
     '12': {'class_type': 'FluxGuidance',       'inputs': {'conditioning': ['6', 0], 'guidance': 3.5}},
 }
+lora_name = os.environ.get('FLUX_LORA_NAME', '').strip()
+if lora_name and not lora_name.lower().endswith('.safetensors'):
+    print('Ignoring non-.safetensors FLUX_LORA_NAME:', lora_name)
+    lora_name = ''
+if lora_name:
+    try:
+        lora_strength = float(os.environ.get('FLUX_LORA_STRENGTH', '0.8') or 0.8)
+    except ValueError:
+        lora_strength = 0.8
+    FLUX_WORKFLOW['13'] = {
+        'class_type': 'LoraLoaderModelOnly',
+        'inputs': {
+            'model': ['4', 0],
+            'lora_name': lora_name,
+            'strength_model': lora_strength,
+        },
+    }
+    FLUX_WORKFLOW['3']['inputs']['model'] = ['13', 0]
 db = sqlite3.connect('/data/webui.db')
 c = db.cursor()
 row = c.execute('SELECT id, data FROM config ORDER BY id DESC LIMIT 1').fetchone()
@@ -258,6 +310,9 @@ img['model'] = 'flux1-dev-Q4_K_S.gguf'
 img['size'] = '1024x1024'
 img['steps'] = 20
 img['openai'] = {}
+# Disable WebUI's LLM-side prompt enhancement so prompts go to ComfyUI verbatim
+# without the chat model softening / rewriting them.
+img['prompt'] = {'enable': False}
 cfg = img.setdefault('comfyui', {})
 cfg['workflow'] = json.dumps(FLUX_WORKFLOW)
 cfg['nodes'] = [

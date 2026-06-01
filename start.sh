@@ -177,6 +177,71 @@ if [ "$OS" = "Darwin" ]; then
     fi
 fi
 
+# ── Install cleanup-media launchd agent (macOS only) ─────────
+# Hourly janitor — surgical orphan GC in WebUI DB + uploads.
+# See cleanup-media.sh for the work it does.
+CLEANUP_LABEL="local.ai-stack.cleanup-media"
+CLEANUP_PLIST="$HOME/Library/LaunchAgents/${CLEANUP_LABEL}.plist"
+
+generate_cleanup_plist() {
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hourly janitor — runs cleanup-media.sh every 3600 seconds.
+  Surgically GCs orphaned WebUI file rows + their bytes on disk
+  and any dangling chat_file rows. Tiny cost per run (<1 s).
+
+  Managed by start.sh — do not edit manually.
+
+  Logs: ${SCRIPT_DIR}/logs/cleanup-media.log (script) and
+        ${SCRIPT_DIR}/logs/cleanup-media.launchd.log (launchd stdio)
+  Disable: launchctl unload ${CLEANUP_PLIST}
+  Run now: ${SCRIPT_DIR}/cleanup-media.sh [--dry-run]
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${CLEANUP_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${SCRIPT_DIR}/cleanup-media.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${HOME}</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>StandardOutPath</key>
+    <string>${SCRIPT_DIR}/logs/cleanup-media.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>${SCRIPT_DIR}/logs/cleanup-media.launchd.log</string>
+</dict>
+</plist>
+EOF
+}
+
+if [ "$OS" = "Darwin" ]; then
+    NEW_CLEANUP_PLIST="$(generate_cleanup_plist)"
+    EXISTING_CLEANUP_PLIST="$(cat "$CLEANUP_PLIST" 2>/dev/null || true)"
+    if [ "$NEW_CLEANUP_PLIST" != "$EXISTING_CLEANUP_PLIST" ]; then
+        mkdir -p "$(dirname "$CLEANUP_PLIST")"
+        printf '%s\n' "$NEW_CLEANUP_PLIST" > "$CLEANUP_PLIST"
+        launchctl unload "$CLEANUP_PLIST" 2>/dev/null || true
+        launchctl load "$CLEANUP_PLIST"
+        echo "Installed launchd agent: $CLEANUP_PLIST (hourly)"
+    fi
+fi
+
 echo "Platform: $PLATFORM"
 echo "Ollama:   $OLLAMA_MODE mode"
 
@@ -622,13 +687,40 @@ db.commit()
             done
         fi
     else
+        # Validate FLUX_LORA_NAME before wiring it in. Only .safetensors (load-only,
+        # no pickle code execution) is allowed; legacy .ckpt/.pt/.bin/.pth pickles
+        # can run arbitrary Python on load and must be refused. Also require the
+        # file to actually exist under loras/ so we fail loudly on typos rather
+        # than silently inserting a broken workflow node.
+        if [ -n "${FLUX_LORA_NAME:-}" ]; then
+            _lora_dir="${COMFYUI_DIR:-$HOME/ComfyUI}/models/loras"
+            _lora_lower="$(printf '%s' "$FLUX_LORA_NAME" | tr '[:upper:]' '[:lower:]')"
+            case "$_lora_lower" in
+                *.safetensors) : ;;
+                *)
+                    echo "WARN: FLUX_LORA_NAME='${FLUX_LORA_NAME}' is not a .safetensors file — refusing to load." >&2
+                    echo "      Legacy pickle formats (.ckpt/.pt/.bin/.pth) can execute arbitrary code on load." >&2
+                    echo "      Ignoring FLUX_LORA_NAME for this run." >&2
+                    FLUX_LORA_NAME=""
+                    ;;
+            esac
+            if [ -n "${FLUX_LORA_NAME:-}" ] && [ ! -f "${_lora_dir}/${FLUX_LORA_NAME}" ]; then
+                echo "WARN: FLUX_LORA_NAME='${FLUX_LORA_NAME}' not found at ${_lora_dir}/." >&2
+                echo "      Ignoring FLUX_LORA_NAME for this run." >&2
+                FLUX_LORA_NAME=""
+            fi
+            unset _lora_dir _lora_lower
+        fi
         # comfyui: patch engine, model, size, and a FLUX.1-dev GGUF workflow.
         # FLUX is wired through three loaders (UnetLoaderGGUF + DualCLIPLoader + VAELoader)
         # plus a FluxGuidance node, so the workflow JSON is set explicitly here — WebUI's
         # built-in default workflow only covers a single CheckpointLoaderSimple.
         # 1024x1024 is FLUX's native training size; smaller dims produce poor results.
-        NEEDS_PATCH=$(docker exec -i open-webui python3 - <<'PY' 2>/dev/null || echo "yes"
-import sqlite3, json
+        NEEDS_PATCH=$(docker exec -i \
+            -e "FLUX_LORA_NAME=${FLUX_LORA_NAME:-}" \
+            -e "FLUX_LORA_STRENGTH=${FLUX_LORA_STRENGTH:-0.8}" \
+            open-webui python3 - <<'PY' 2>/dev/null || echo "yes"
+import sqlite3, json, os
 row = sqlite3.connect('/app/backend/data/webui.db').cursor().execute(
     "SELECT data FROM config ORDER BY id DESC LIMIT 1").fetchone()
 img = json.loads(row[0])['image_generation'] if row else {}
@@ -637,12 +729,22 @@ size_ok = img.get('size') == '1024x1024'
 engine_ok = (img.get('engine') or 'comfyui') == 'comfyui'
 model_ok = img.get('model') == 'flux1-dev-Q4_K_S.gguf'
 openai_ok = not (img.get('openai') or {}).get('api_base_url')
+prompt_passthru_ok = (img.get('prompt') or {}).get('enable') is False
+lora_name = os.environ.get('FLUX_LORA_NAME', '').strip()
 try:
     wf = json.loads(img.get('comfyui', {}).get('workflow') or '{}')
     workflow_ok = wf.get('4', {}).get('class_type') == 'UnetLoaderGGUF'
+    # LoRA drift check: workflow must match what .env asks for.
+    if lora_name:
+        n13 = wf.get('13', {})
+        lora_ok = (n13.get('class_type') == 'LoraLoaderModelOnly'
+                   and n13.get('inputs', {}).get('lora_name') == lora_name)
+    else:
+        lora_ok = '13' not in wf
+    workflow_ok = workflow_ok and lora_ok
 except Exception:
     workflow_ok = False
-print("no" if (nodes_ok and size_ok and engine_ok and model_ok and openai_ok and workflow_ok) else "yes")
+print("no" if (nodes_ok and size_ok and engine_ok and model_ok and openai_ok and workflow_ok and prompt_passthru_ok) else "yes")
 PY
         )
         if [ "$NEEDS_PATCH" = "yes" ]; then
@@ -652,8 +754,11 @@ PY
             # shutdown, which would clobber our patch. `kill` (SIGKILL) skips the flush.
             docker compose kill open-webui >/dev/null 2>&1
             docker compose rm -f open-webui >/dev/null 2>&1
-            docker run --rm -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
-import sqlite3, json
+            docker run --rm \
+                -e "FLUX_LORA_NAME=${FLUX_LORA_NAME:-}" \
+                -e "FLUX_LORA_STRENGTH=${FLUX_LORA_STRENGTH:-0.8}" \
+                -v "${WEBUI_VOLUME}:/data" python:3.12-alpine python -c "
+import sqlite3, json, os
 FLUX_WORKFLOW = {
     '3':  {'class_type': 'KSampler', 'inputs': {
         'seed': 0, 'steps': 20, 'cfg': 1.0,
@@ -675,6 +780,27 @@ FLUX_WORKFLOW = {
     }},
     '12': {'class_type': 'FluxGuidance',       'inputs': {'conditioning': ['6', 0], 'guidance': 3.5}},
 }
+# Optional LoRA: insert LoraLoaderModelOnly between UnetLoaderGGUF and KSampler.
+# Belt-and-suspenders: shell-layer already validates the file, but reject anything
+# that isn't a .safetensors here too so a stale env var can't sneak a pickle in.
+lora_name = os.environ.get('FLUX_LORA_NAME', '').strip()
+if lora_name and not lora_name.lower().endswith('.safetensors'):
+    print('Ignoring non-.safetensors FLUX_LORA_NAME:', lora_name)
+    lora_name = ''
+if lora_name:
+    try:
+        lora_strength = float(os.environ.get('FLUX_LORA_STRENGTH', '0.8') or 0.8)
+    except ValueError:
+        lora_strength = 0.8
+    FLUX_WORKFLOW['13'] = {
+        'class_type': 'LoraLoaderModelOnly',
+        'inputs': {
+            'model': ['4', 0],
+            'lora_name': lora_name,
+            'strength_model': lora_strength,
+        },
+    }
+    FLUX_WORKFLOW['3']['inputs']['model'] = ['13', 0]
 db = sqlite3.connect('/data/webui.db')
 c = db.cursor()
 row = c.execute('SELECT id, data FROM config ORDER BY id DESC LIMIT 1').fetchone()
@@ -685,6 +811,9 @@ img['model'] = 'flux1-dev-Q4_K_S.gguf'
 img['size'] = '1024x1024'
 img['steps'] = 20
 img['openai'] = {}
+# Disable WebUI's LLM-side prompt enhancement so prompts go to ComfyUI verbatim
+# without the chat model softening / rewriting them.
+img['prompt'] = {'enable': False}
 cfg = img.setdefault('comfyui', {})
 cfg['workflow'] = json.dumps(FLUX_WORKFLOW)
 cfg['nodes'] = [

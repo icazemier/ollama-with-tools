@@ -77,6 +77,43 @@ Now you have:
 ./start.sh              # Start again
 ```
 
+## Automatic cleanup
+
+Open WebUI never garbage-collects its own file references — when you
+delete a chat in the UI, the `file` row and its bytes in
+`/app/backend/data/uploads/` stay forever. Over time the SQLite DB and
+the volume bloat with orphaned attachments and generated-image copies.
+
+`cleanup-media.sh` does a surgical GC across every chat-related table:
+
+- delete `file` rows not referenced by any `chat_file`, `channel_file`,
+  or `knowledge_file` row, plus their bytes on disk;
+- delete `chat_file`, `chat_message`, `shared_chat`, `chatidtag`,
+  `automation_run` rows whose `chat_id` no longer matches any `chat`;
+- VACUUM the DB.
+
+Every deletion is a strict anti-join — only rows with no live reference
+go away. Nothing heuristic; nothing user-owned but not chat-bound (tags,
+feedback, user accounts, folders, knowledge bases) is touched.
+
+It runs **every hour** via launchd (agent
+`local.ai-stack.cleanup-media`, installed by `start.sh`). Each run takes
+under a second; no measurable cost.
+
+```bash
+./cleanup-media.sh             # run now
+./cleanup-media.sh --dry-run   # preview what would be removed
+```
+
+Logs live at `logs/cleanup-media.log`. A timestamped backup of the
+WebUI DB is written inside the container (`webui.db.bak-cleanup-…`)
+before each real run.
+
+The script deliberately **does not touch `~/ComfyUI/output/`**. WebUI
+re-encodes images on import, so there's no byte-level correlation that
+would let us prove a ComfyUI-side file is orphaned — those PNGs are the
+full-quality originals; manage that directory by hand if it grows.
+
 ## Teardown
 
 ```bash
@@ -340,6 +377,57 @@ and drop it into `~/ComfyUI/models/unet/`. Quants on this hardware:
 After dropping a new file in, also update the `unet_name` reference in
 `start.sh` (WebUI DB patch + warmup workflow) and `boot-stack.sh`, or just
 edit it in **WebUI → Admin → Settings → Images → Default Model**.
+
+### Adding a LoRA on top of FLUX
+
+LoRAs are small (~50–300 MB) style/concept add-ons that ride alongside the
+base UNet. The stack supports a single LoRA via two `.env` variables:
+
+```dotenv
+FLUX_LORA_NAME=my-style.safetensors
+FLUX_LORA_STRENGTH=0.8
+```
+
+Steps:
+
+1. Drop a FLUX-compatible `.safetensors` LoRA into
+   `~/ComfyUI/models/loras/`. Civitai and Hugging Face both host plenty —
+   make sure the model card says **FLUX.1** (SDXL LoRAs won't work).
+2. Set `FLUX_LORA_NAME` to the filename only (no path). Leave it empty to
+   disable. `FLUX_LORA_STRENGTH` is the model strength (typical range
+   0.6–1.0; the LoRA's README usually recommends a value).
+3. Re-run `./start.sh`. The patcher injects a `LoraLoaderModelOnly` node
+   between `UnetLoaderGGUF` and the sampler, and rewrites the WebUI default
+   workflow. Drift detection means subsequent runs are a no-op until you
+   change the name/strength again.
+
+**Shortcut: `./add-lora.sh <hf-url>`** does steps 1–3 in one shot — downloads
+into `~/ComfyUI/models/loras/`, edits `.env`, and re-runs `./start.sh`. Pass
+`--strength 0.7` to set the strength, `--name foo.safetensors` to rename on
+download, `--token hf_xxx` for gated repos, or `--no-restart` to skip the
+apply. `./add-lora.sh --help` for full usage.
+
+If the target file already lives in `~/ComfyUI/models/loras/`, the script
+skips the download and still updates `.env` + re-runs `./start.sh` — so
+re-running with the same URL is a cheap way to **switch back** to an
+already-downloaded LoRA. To force a fresh download, `rm` the file first.
+
+**Safety: only `.safetensors` is accepted.** Legacy weight formats
+(`.ckpt`, `.pt`, `.bin`, `.pth`) are Python pickles and can execute
+arbitrary code on load. Both `start.sh` and `boot-stack.sh` refuse anything
+that isn't `.safetensors` and warn loudly if `FLUX_LORA_NAME` points at a
+file that doesn't exist on disk. The bytes in a `.safetensors` are inert
+tensors, but the *behavior* a LoRA biases the model toward is still on you:
+prefer LoRAs from named authors with documented trigger words, and skip
+the ones with zero downloads and an empty model card.
+
+Memory impact is small (LoRAs add ~1–2 GB on top of the UNet) but **does**
+eat into the FLUX/Ollama coexistence margin — if you start seeing noise
+grids again, that's the reason. Drop to a smaller quant or `qwen2.5-coder:7b`.
+
+To stack multiple LoRAs you'd need a custom workflow in ComfyUI's own UI
+(`http://localhost:8188`); the WebUI-driven path here is single-LoRA only
+by design.
 
 ## LAN access
 
