@@ -248,10 +248,11 @@ echo "Ollama:   $OLLAMA_MODE mode"
 case "$OLLAMA_MODE" in
     native)
         echo "          Ollama runs on your host with GPU acceleration."
-        echo "          Open WebUI and Caddy run in Docker; ComfyUI runs natively."
+        echo "          Open WebUI runs in Docker; Caddy and ComfyUI run natively."
         ;;
     docker)
-        echo "          Everything runs in Docker. CPU-only but fully isolated."
+        echo "          Ollama and Open WebUI run in Docker (CPU-only, isolated)."
+        echo "          Caddy runs natively (needs host port 443 — Lima can't forward it)."
         ;;
     *)
         echo "Error: OLLAMA_MODE must be 'native' or 'docker' (got: $OLLAMA_MODE)"
@@ -530,6 +531,120 @@ if [ ! -f "$CERT_FILE" ] || [ ! -f "$KEY_FILE" ]; then
     echo "  Linux:       Add to /usr/local/share/ca-certificates/ and run update-ca-certificates"
 fi
 
+# ── Step 4b: Install Caddy as a system LaunchDaemon ──────────
+# Caddy terminates HTTPS on port 443. Colima/Lima cannot forward host
+# ports below 1024 — its port forwarder uses unprivileged SSH -L, which
+# can't bind privileged ports on macOS — so Caddy lives outside Docker
+# and runs natively as root (the only way to bind :443 on macOS without
+# socket activation). It reverse-proxies to http://127.0.0.1:${WEBUI_PORT}.
+# The LaunchDaemon starts at boot before any user logs in, so HTTPS is
+# answering before login. Idempotent: only sudo-prompts when the plist
+# content actually changes.
+CADDY_LABEL="local.ai-stack.caddy"
+CADDY_PLIST="/Library/LaunchDaemons/${CADDY_LABEL}.plist"
+WEBUI_PORT="${WEBUI_PORT:-3000}"
+
+generate_caddy_plist() {
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Caddy — native HTTPS:443 termination for Open WebUI.
+
+  System LaunchDaemon (runs as root so it can bind privileged port 443).
+  Reads ${SCRIPT_DIR}/Caddyfile, terminates TLS with the mkcert certs in
+  ${SCRIPT_DIR}/certs/, reverse-proxies to http://127.0.0.1:${WEBUI_PORT}.
+
+  Managed by start.sh — do not edit manually.
+
+  Logs:    tail -f ${SCRIPT_DIR}/logs/caddy.log
+  Restart: sudo launchctl kickstart -k system/${CADDY_LABEL}
+  Unload:  sudo launchctl bootout system ${CADDY_PLIST}
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${CADDY_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/caddy</string>
+        <string>run</string>
+        <string>--config</string>
+        <string>${SCRIPT_DIR}/Caddyfile</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>${SCRIPT_DIR}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Without HOME, Caddy stores autosave/cache under ./caddy/
+             relative to WorkingDirectory, polluting the project tree. -->
+        <key>HOME</key>
+        <string>/var/root</string>
+        <key>AI_STACK_CERT</key>
+        <string>${SCRIPT_DIR}/certs/cert.pem</string>
+        <key>AI_STACK_KEY</key>
+        <string>${SCRIPT_DIR}/certs/key.pem</string>
+        <key>AI_STACK_UPSTREAM</key>
+        <string>127.0.0.1:${WEBUI_PORT}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>${SCRIPT_DIR}/logs/caddy.log</string>
+    <key>StandardErrorPath</key>
+    <string>${SCRIPT_DIR}/logs/caddy.log</string>
+</dict>
+</plist>
+EOF
+}
+
+if [ "$OS" = "Darwin" ]; then
+    mkdir -p "$SCRIPT_DIR/logs"
+
+    if ! command -v caddy > /dev/null 2>&1; then
+        if command -v brew > /dev/null 2>&1; then
+            echo "Installing Caddy via brew (one-time)..."
+            brew install caddy
+        else
+            echo "Error: caddy is not installed and brew is unavailable."
+            echo "       Install Caddy manually, then re-run ./start.sh"
+            exit 1
+        fi
+    fi
+
+    NEW_CADDY_PLIST="$(generate_caddy_plist)"
+    EXISTING_CADDY_PLIST="$(cat "$CADDY_PLIST" 2>/dev/null || true)"
+    if [ "$NEW_CADDY_PLIST" != "$EXISTING_CADDY_PLIST" ]; then
+        echo "Installing Caddy LaunchDaemon (system-level — sudo prompt incoming)..."
+        if printf '%s\n' "$NEW_CADDY_PLIST" | sudo tee "$CADDY_PLIST" >/dev/null && \
+           sudo chown root:wheel "$CADDY_PLIST" && \
+           sudo chmod 644 "$CADDY_PLIST"; then
+            sudo launchctl bootout "system/${CADDY_LABEL}" 2>/dev/null || true
+            # bootout is async — bootstrapping during teardown fails with
+            # "Bootstrap failed: 5: Input/output error". Poll until the
+            # service is fully gone before re-registering. ~7.5 s ceiling.
+            for _i in $(seq 1 15); do
+                if ! sudo launchctl print "system/${CADDY_LABEL}" >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 0.5
+            done
+            sudo launchctl bootstrap system "$CADDY_PLIST"
+            echo "Installed system LaunchDaemon: $CADDY_PLIST"
+        else
+            echo "Warning: Caddy LaunchDaemon install skipped (sudo denied)."
+            echo "         HTTPS on :443 will not work until installed. HTTP on :${WEBUI_PORT} is fine."
+        fi
+    fi
+fi
+
 # ── Step 5: Ensure models are downloaded ──────────────────────
 if [ "$OLLAMA_MODE" = "docker" ]; then
     # Stop Ollama if it's running from a previous start — two Ollama
@@ -553,6 +668,39 @@ fi
 if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ "$IMAGE_GEN_BACKEND" = "comfyui" ] && [ -x "./start-comfyui.sh" ]; then
     echo ""
     ./start-comfyui.sh || echo "Warning: ComfyUI failed to start — Open WebUI will run without image generation."
+fi
+
+# ── Step 6a: Allow ComfyUI venv Python through macOS firewall ─
+# macOS Application Firewall silently drops payloads to unsigned binaries
+# on non-loopback interfaces (even when bound to 0.0.0.0). ComfyUI runs
+# from a venv Python that isn't in the allow-list by default — so LAN
+# devices can't reach :${COMFYUI_PORT}. Whitelist it once; idempotent on
+# subsequent runs (skipped silently when already present).
+if [ "$OS" = "Darwin" ] && [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ "$IMAGE_GEN_BACKEND" = "comfyui" ]; then
+    COMFYUI_DIR="${COMFYUI_DIR:-$HOME/ComfyUI}"
+    COMFYUI_PYTHON_BIN="$COMFYUI_DIR/venv/bin/python"
+    SOCKETFILTER="/usr/libexec/ApplicationFirewall/socketfilterfw"
+    _COMFYUI_PORT="${COMFYUI_PORT:-8188}"
+    _LAN_IP_FW="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+
+    # Probe behavior, not config: macOS Application Firewall may match by
+    # code signature rather than strict path, so an existing whitelist on
+    # *any* brew Python often covers our venv too. If ComfyUI already
+    # answers on the LAN IP, nothing to fix. Only when localhost works
+    # AND the LAN IP times out does the firewall need the venv added.
+    if [ -x "$COMFYUI_PYTHON_BIN" ] && [ -x "$SOCKETFILTER" ] && [ -n "$_LAN_IP_FW" ]; then
+        if curl -sf -m 2 "http://127.0.0.1:${_COMFYUI_PORT}/system_stats" >/dev/null 2>&1 && \
+           ! curl -sf -m 3 "http://${_LAN_IP_FW}:${_COMFYUI_PORT}/system_stats" >/dev/null 2>&1; then
+            echo "Whitelisting ComfyUI venv Python in macOS Application Firewall (sudo)..."
+            if sudo "$SOCKETFILTER" --add "$COMFYUI_PYTHON_BIN" >/dev/null && \
+               sudo "$SOCKETFILTER" --unblockapp "$COMFYUI_PYTHON_BIN" >/dev/null; then
+                echo "  ComfyUI is now reachable on the LAN at http://${_LAN_IP_FW}:${_COMFYUI_PORT}"
+            else
+                echo "Warning: firewall whitelist failed — ComfyUI may not be reachable from LAN."
+            fi
+        fi
+    fi
+    unset _COMFYUI_PORT _LAN_IP_FW
 fi
 
 # ── Step 6b: Pre-load the FLUX model ─────────────────────────
@@ -620,10 +768,12 @@ fi
 # ── Step 7: Start the stack ───────────────────────────────────
 echo ""
 echo "Starting local AI stack..."
+# --remove-orphans cleans up the old `caddy` container left behind by the
+# move from containerized Caddy to native Caddy (system LaunchDaemon).
 if [ "$OLLAMA_MODE" = "docker" ]; then
-    docker compose --profile docker up -d --build
+    docker compose --profile docker up -d --build --remove-orphans
 else
-    docker compose up -d --build
+    docker compose up -d --build --remove-orphans
 fi
 
 echo ""
@@ -855,6 +1005,6 @@ if [ "$ENABLE_IMAGE_GENERATION" = "true" ]; then
         echo "Draw Things: running natively on your host (localhost:${DRAW_THINGS_PORT})"
         echo "DT Proxy:    A1111 shim on localhost:${DRAW_THINGS_PROXY_PORT} → Draw Things"
     else
-        echo "ComfyUI:     running natively on your host (localhost:${COMFYUI_PORT})"
+        echo "ComfyUI:    http://localhost:${COMFYUI_PORT}  (this machine)${LAN_IP:+", http://$LAN_IP:${COMFYUI_PORT}  (LAN — IP)"}"
     fi
 fi

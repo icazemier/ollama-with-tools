@@ -70,6 +70,7 @@ PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 # ── Confirm ──────────────────────────────────────────────────
 echo "This will remove:"
 echo "  - Docker containers and volumes (chat history, Docker-mode Ollama models)"
+echo "  - Native Caddy LaunchDaemon (HTTPS:443 terminator)"
 if [ "$FULL" = true ]; then
     echo "  - ComfyUI launchd agent + $COMFYUI_DIR"
 fi
@@ -94,6 +95,17 @@ else
 fi
 echo "Done."
 echo ""
+
+# ── Step 1b: Unload native Caddy LaunchDaemon ────────────────
+CADDY_LABEL="local.ai-stack.caddy"
+CADDY_PLIST="/Library/LaunchDaemons/${CADDY_LABEL}.plist"
+if [ "$OS" = "Darwin" ] && [ -f "$CADDY_PLIST" ]; then
+    echo "Unregistering Caddy LaunchDaemon (requires sudo)..."
+    sudo launchctl bootout "system/${CADDY_LABEL}" 2>/dev/null || true
+    sudo rm -f "$CADDY_PLIST"
+    echo "  Removed $CADDY_PLIST"
+    echo ""
+fi
 
 # ── Step 2 (--full): Remove ComfyUI ──────────────────────────
 if [ "$FULL" = true ]; then

@@ -6,12 +6,18 @@ Run AI models on your own machine. Your code and conversations never leave your 
 
 You'll need a Docker engine ([Colima](https://github.com/abiosoft/colima)
 recommended — see [Container engine](#container-engine) below),
-[Ollama](https://ollama.com/download), and [mkcert](https://github.com/FiloSottile/mkcert)
-installed. Then:
+[Ollama](https://ollama.com/download), [mkcert](https://github.com/FiloSottile/mkcert),
+and [Caddy](https://caddyserver.com/) (`brew install caddy` — `start.sh`
+will install it for you if missing). Then:
 
 ```bash
 ./start.sh
 ```
+
+> First run prompts for your sudo password once. It writes a system
+> LaunchDaemon for Caddy (so HTTPS:443 binds at boot) and adds the
+> ComfyUI venv Python to the macOS firewall (so other LAN devices can
+> reach image generation). Subsequent runs are sudo-free.
 
 Open **https://localhost** — you now have a local ChatGPT (with image
 generation, mic, camera). HTTP fallback at http://localhost:3000.
@@ -133,22 +139,50 @@ The stack runs in two layers:
 | Container | What it does | Internet? |
 |---|---|---|
 | **Open WebUI** | Chat UI for your browser + API for VS Code | Local only |
-| **Caddy** | HTTPS reverse proxy (TLS termination on port 443) | Local only |
 | **Ollama** *(docker mode)* | Runs LLMs in a container | Blocked — cannot phone home |
 
-**Native on the host (for GPU access):**
+**Native on the host (managed by launchd):**
 
 | Process | What it does | Why native |
 |---|---|---|
+| **Caddy** | HTTPS:443 terminator → reverse-proxy to WebUI | Colima/Lima can't forward host ports < 1024 (its port-forwarder uses unprivileged SSH); Caddy outside Docker is the only way HTTPS actually binds |
 | **Ollama** *(native mode, default)* | Runs LLMs with Metal GPU | Docker on Mac has no Metal access |
 | **ComfyUI** | Image generation with Metal GPU | Same — needs MPS for speed |
 
-Both native processes are registered as **launchd user agents** on macOS, so
-they auto-start on login and restart automatically if they crash. `start.sh`
-installs these agents on first run — no manual setup needed.
+Caddy runs as a **system LaunchDaemon** (loaded into the root domain), so it
+starts at boot *before* anyone logs in — HTTPS answers from a cold power-on.
+Ollama and ComfyUI run as **user LaunchAgents** that start at login.
 
-Open WebUI (in Docker) reaches both native processes via `host.docker.internal`.
-The Docker network is internal-only — no LLM container can reach the internet.
+`start.sh` installs all three on first run. The Caddy install needs **one
+sudo prompt** the first time, to write its plist into `/Library/LaunchDaemons/`;
+afterwards every `./start.sh` is sudo-free (and idempotent — sudo is only
+re-prompted if the plist content actually changes).
+
+Open WebUI (in Docker) is reached by Caddy via `http://127.0.0.1:${WEBUI_PORT}`
+on the host. The Docker network for AI containers is internal-only — no LLM
+container can reach the internet.
+
+### LAN access
+
+Once `./start.sh` has run, the stack is reachable from any device on your
+local network:
+
+| URL | Goes to |
+|---|---|
+| `https://ai.local` *(mDNS)* | Open WebUI via Caddy (real HTTPS, trusted cert) |
+| `https://<your-mac-LAN-IP>` | Same — for devices that don't do mDNS |
+| `http://<your-mac-LAN-IP>:8188` | ComfyUI direct (image-gen API + UI) |
+| `http://<your-mac-LAN-IP>:11434` | Ollama direct (LLM API) |
+
+To trust the HTTPS cert on phones/tablets/other laptops, install the mkcert
+root CA on them — `start.sh` prints the CA file path on first run.
+
+> **ComfyUI on LAN — firewall whitelist:** macOS's Application Firewall
+> silently drops connections to unsigned binaries on non-loopback interfaces,
+> even when the binary listens on `0.0.0.0`. `start.sh` adds the ComfyUI
+> venv Python to the firewall allow-list automatically (one sudo prompt the
+> first time). Without that step, ComfyUI would only be reachable from the
+> host itself.
 
 Verify it yourself: `./test-privacy.sh`
 

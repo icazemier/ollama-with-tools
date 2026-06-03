@@ -108,9 +108,9 @@ fi
 # ── Bring up the Docker stack ────────────────────────────────
 log "Starting Docker stack..."
 if [ "$OLLAMA_MODE" = "docker" ]; then
-    docker compose --profile docker up -d
+    docker compose --profile docker up -d --remove-orphans
 else
-    docker compose up -d
+    docker compose up -d --remove-orphans
 fi
 log "Docker stack up."
 

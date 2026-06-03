@@ -2,6 +2,7 @@ workspace/
 .env
 docker-compose.override.yml
 certs/
+caddy/
 *.log
 logs/
 .claude/
