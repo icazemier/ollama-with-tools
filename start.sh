@@ -664,6 +664,15 @@ else
     echo ""
 fi
 
+# ── Step 5b: Build custom-context coder model ─────────────────
+# Extends qwen2.5-coder:14b to 16K context (32K caused CPU offload on 16 GB).
+if [ "$OLLAMA_MODE" = "native" ] && command -v ollama > /dev/null 2>&1; then
+    if ! ollama show qwen2.5-coder-16k > /dev/null 2>&1; then
+        echo "Building qwen2.5-coder-16k (extended 16K context)..."
+        ollama create qwen2.5-coder-16k -f "$SCRIPT_DIR/qwen-coder.Modelfile"
+    fi
+fi
+
 # ── Step 6: Start ComfyUI natively (image generation) ────────
 if [ "$ENABLE_IMAGE_GENERATION" = "true" ] && [ "$IMAGE_GEN_BACKEND" = "comfyui" ] && [ -x "./start-comfyui.sh" ]; then
     echo ""

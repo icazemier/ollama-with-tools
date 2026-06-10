@@ -1,0 +1,3 @@
+FROM qwen2.5-coder:14b
+# 16K fits on 16 GB unified memory — 32K caused CPU offload (tested).
+PARAMETER num_ctx 16384
